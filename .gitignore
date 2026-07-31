@@ -1,0 +1,43 @@
+# Data — never commit. The parquet download is ~17 GB and the tokenized
+# uint16 shards are another ~10 GB; both are reproducible from
+# llmro-test/download_data.py plus the tokenizer.
+data/
+*.parquet
+*.arrow
+*.bin
+
+# Tokenized corpus shards
+*.npy
+*.uint16
+
+# Checkpoints (Orbax) — large and reproducible
+checkpoints/
+*.ckpt
+*.orbax-checkpoint*
+
+# JAX compilation cache
+jax_cache/
+.jax_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Logs and scratch
+*.log
+scratch/
+wandb/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
