@@ -269,7 +269,7 @@ def train_step(
 
     loss, grads = nnx.value_and_grad(loss_fn)(model)
     optimizer.update(model, grads)
-    return loss
+    return loss, optax.global_norm(grads)
 
 
 def generate(
@@ -310,10 +310,10 @@ if __name__ == "__main__":
     cfg = ModelConfig(
         seed=0,
         vocab_size=24_576,
-        d_model=256,
-        n_heads=4,
-        d_hidden=704,
-        n_layers=6,
+        d_model=768,
+        n_heads=12,
+        d_hidden=2048,
+        n_layers=12,
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
     )
@@ -336,7 +336,9 @@ if __name__ == "__main__":
     assert n_params == 11_112_448, f"debug config param count changed: {n_params:,}"
 
     optimizer = nnx.Optimizer(model, optax.adamw(1e-3), wrt=nnx.Param)
-    print(f"ln(vocab) = {float(jnp.log(cfg.vocab_size)):.5f}  <-- where it should start")
+    print(
+        f"ln(vocab) = {float(jnp.log(cfg.vocab_size)):.5f}  <-- where it should start"
+    )
     for step in range(201):
         loss = train_step(model, optimizer, x, cos, sin, y)
         if step % 10 == 0:

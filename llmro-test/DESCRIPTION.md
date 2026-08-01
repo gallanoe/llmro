@@ -133,7 +133,17 @@ The good news: **it comes free from the same download.** `sample-10BT` carries `
 
 **score ≥ 4 = 13.89% of tokens.** The guess of "~1–1.5B from a 10B sample" was right, at the top of its range — the full sample yields ~1.53B of our tokens. Mean doc length measured 1040 GPT-2 tokens against the assumed 1030, so the intra-document-masking argument in the unverified-numbers list stands.
 
-Budget check at the 8 shards actually pulled: **6.29B our-tokens total → 0.87B anneal pool, 5.41B base.** Against a requirement of 600M anneal + 4.4B base, that fits with room. Do not drop below 7 shards.
+**Final, after tokenizing all 8 shards** (supersedes every projection above):
+
+| Pool | Tokens | Required | Slack |
+|---|---|---|---|
+| base (`int_score == 3`) | **5.317B** | 4.4B | 21% |
+| anneal (`int_score >= 4`) | **0.865B** | 600M | 44% |
+| total | **6.182B** | 5.0B | |
+
+Anneal came out at **14.00%** of tokens against the 13.89% measured on shard 0 — the sample held.
+
+**Filter on `int_score`, not `score`.** `int_score` is `round(score)`, so `int_score >= 4` captures everything from 3.5 up. Filtering the float `score >= 4.0` yields only **2.16%** of tokens instead of 13.89%, producing an anneal pool 4.5× too small for the decay phase. Both columns exist, both are numeric, both filter without error, and the output looks entirely plausible — only the ratio gives it away. This bug was made and caught here.
 
 One thing the arithmetic assumes: that score ≥ 4 docs are *carved out* of the base corpus rather than used in both. If you leave them in the pretraining mix as well, the anneal stops being a distribution shift and the §10 "bpb drops visibly at the swap" signal disappears.
 
@@ -386,6 +396,10 @@ Flagged so they get checked rather than inherited. This list is longer than llmr
 - **Whether the BFC allocator ceiling is a jaxlib 0.11.0 bug, a WSL2 limitation, or driver 610.47 specifically.** Not diagnosed further — `cuda_async` works, and root-causing it isn't on the critical path. Worth re-testing on any upgrade.
 - ~~**score ≥ 4 anneal yield**~~ → **13.89% of tokens**, measured over shard 0's full 726k docs. ~1.53B from the full 10B sample; the guess held.
 - ~~**Mean document length ≈ 1030 tokens**~~ → **1040 measured.** The intra-document-masking argument stands.
-- **Token yield of `sample-10BT` under a 24k BPE** — the ±15% cancellation argument is still reasoning, not measurement. This is now the *only* unmeasured number in the data budget, and it resolves the moment you encode shard 0: compare the real output count against `token_count.sum()`, which is the GPT-2 baseline sitting right there in the parquet.
+- ~~**Token yield of `sample-10BT` under a 24k BPE**~~ → **measured at 4.439 chars/token** against the GPT-2 baseline of 4.56 on this corpus. Inflation is **1.027**, not the assumed 1.10.
+
+  The ±15% cancellation argument in §4 was right, and better than it claimed: a 24k vocab compresses this corpus *almost as well as* GPT-2's 50k. Domain match beat vocab size — ours is trained on FineWeb-Edu, GPT-2's on Reddit outbound links.
+
+  Consequence for the budget: 8 shards yield **~5.87B tokens**, not the ~6.3B projected at 1.10. Still above the 5B requirement, but headroom drops from ~26% to ~17%. Split: **0.81B anneal pool** (need 600M), **5.05B base** (need 4.4B). Both fit; neither has room to lose a shard.
 
 *Dataset sizes in §4 are verified — pulled live from the HuggingFace datasets-server, not recalled.*

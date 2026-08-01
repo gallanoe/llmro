@@ -6,11 +6,17 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "flax>=0.12.8",
+    "grain>=0.2.18",
     "huggingface-hub>=1.26.0",
     "jax[cuda13]>=0.11.0",
     "jaxlib>=0.11.0",
     "jaxtyping>=0.3.11",
     "numpy>=2.5.1",
     "optax>=0.2.8",
+    "orbax>=0.1.9",
     "pyarrow>=25.0.0",
+    "tensorboard>=2.21.0",
+    "tensorboardx>=2.6.5",
+    "tokenizers>=0.23.1",
+    "tqdm>=4.70.0",
 ]
