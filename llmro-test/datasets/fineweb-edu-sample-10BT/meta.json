@@ -1,0 +1,100 @@
+{
+  "tokenizer_sha256": "014a5b45e3cafd5d1b1d77aefb418575e09dcf87afde42da723c541bbac60a9e",
+  "seq_len": 1024,
+  "vocab_size": 24576,
+  "dtype": "uint16",
+  "eos_id": 0,
+  "note": "base shards: read only the first `usable` tokens. The tail is heldout.",
+  "base": {
+    "000.npy": {
+      "tokens": 666885106,
+      "usable": 666217472
+    },
+    "001.npy": {
+      "tokens": 664493210,
+      "usable": 663828480
+    },
+    "002.npy": {
+      "tokens": 665144427,
+      "usable": 664478720
+    },
+    "003.npy": {
+      "tokens": 663453625,
+      "usable": 662790144
+    },
+    "004.npy": {
+      "tokens": 661081825,
+      "usable": 660420608
+    },
+    "005.npy": {
+      "tokens": 664047294,
+      "usable": 663383040
+    },
+    "006.npy": {
+      "tokens": 666635222,
+      "usable": 665967616
+    },
+    "007.npy": {
+      "tokens": 665575112,
+      "usable": 664908800
+    }
+  },
+  "anneal": {
+    "000.npy": {
+      "tokens": 107209835
+    },
+    "001.npy": {
+      "tokens": 108327821
+    },
+    "002.npy": {
+      "tokens": 107730128
+    },
+    "003.npy": {
+      "tokens": 107814059
+    },
+    "004.npy": {
+      "tokens": 109418446
+    },
+    "005.npy": {
+      "tokens": 108582924
+    },
+    "006.npy": {
+      "tokens": 107904456
+    },
+    "007.npy": {
+      "tokens": 108451198
+    }
+  },
+  "heldout": {
+    "000.npy": {
+      "tokens": 667634
+    },
+    "001.npy": {
+      "tokens": 664730
+    },
+    "002.npy": {
+      "tokens": 665707
+    },
+    "003.npy": {
+      "tokens": 663481
+    },
+    "004.npy": {
+      "tokens": 661217
+    },
+    "005.npy": {
+      "tokens": 664254
+    },
+    "006.npy": {
+      "tokens": 667606
+    },
+    "007.npy": {
+      "tokens": 666312
+    }
+  },
+  "totals": {
+    "base_usable": 5311994880,
+    "anneal": 865438867,
+    "heldout": 5320941,
+    "base_windows": 5187495
+  }
+}
