@@ -4,39 +4,31 @@
   "vocab_size": 24576,
   "dtype": "uint16",
   "eos_id": 0,
-  "note": "base shards: read only the first `usable` tokens. The tail is heldout.",
+  "heldout_rule": "1/1000 of base documents, by blake2b(id)",
   "base": {
     "000.npy": {
-      "tokens": 666885106,
-      "usable": 666217472
+      "tokens": 666211707
     },
     "001.npy": {
-      "tokens": 664493210,
-      "usable": 663828480
+      "tokens": 663801719
     },
     "002.npy": {
-      "tokens": 665144427,
-      "usable": 664478720
+      "tokens": 664351280
     },
     "003.npy": {
-      "tokens": 663453625,
-      "usable": 662790144
+      "tokens": 662843403
     },
     "004.npy": {
-      "tokens": 661081825,
-      "usable": 660420608
+      "tokens": 660372109
     },
     "005.npy": {
-      "tokens": 664047294,
-      "usable": 663383040
+      "tokens": 663437292
     },
     "006.npy": {
-      "tokens": 666635222,
-      "usable": 665967616
+      "tokens": 665989373
     },
     "007.npy": {
-      "tokens": 665575112,
-      "usable": 664908800
+      "tokens": 664818260
     }
   },
   "anneal": {
@@ -67,34 +59,39 @@
   },
   "heldout": {
     "000.npy": {
-      "tokens": 667634
+      "tokens": 673399
     },
     "001.npy": {
-      "tokens": 664730
+      "tokens": 691491
     },
     "002.npy": {
-      "tokens": 665707
+      "tokens": 793147
     },
     "003.npy": {
-      "tokens": 663481
+      "tokens": 610222
     },
     "004.npy": {
-      "tokens": 661217
+      "tokens": 709716
     },
     "005.npy": {
-      "tokens": 664254
+      "tokens": 610002
     },
     "006.npy": {
-      "tokens": 667606
+      "tokens": 645849
     },
     "007.npy": {
-      "tokens": 666312
+      "tokens": 756852
     }
   },
   "totals": {
-    "base_usable": 5311994880,
+    "base": 5311825143,
     "anneal": 865438867,
-    "heldout": 5320941,
-    "base_windows": 5187495
+    "heldout": 5490678,
+    "base_windows": 5187329
+  },
+  "heldout_totals": {
+    "tokens": 5490678,
+    "bytes": 24583754,
+    "bytes_per_token": 4.47736217640153
   }
 }

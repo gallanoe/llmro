@@ -252,26 +252,6 @@ class LLM(nnx.Module):
         return self.embed.attend(x)
 
 
-@nnx.jit
-def train_step(
-    model: LLM,
-    optimizer: nnx.Optimizer,
-    x: Int[Array, "batch seq"],
-    cos: Float[Array, "seq d_head"],
-    sin: Float[Array, "seq d_head"],
-    y: Int[Array, "batch seq"],
-):
-    def loss_fn(m: LLM):
-        logits = m(x, cos, sin)
-        return optax.softmax_cross_entropy_with_integer_labels(
-            logits.astype(jnp.float32), y
-        ).mean()
-
-    loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(model, grads)
-    return loss, optax.global_norm(grads)
-
-
 def generate(
     model: LLM,
     cfg: ModelConfig,

@@ -5,11 +5,15 @@ import optax
 from flax import nnx
 import orbax.checkpoint as ocp
 import grain.python as g
-from model import LLM, ModelConfig, rope_tables, train_step
+from model import LLM, ModelConfig, rope_tables
+import json
+import hashlib
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 from tensorboardX import SummaryWriter
+from typing import Tuple
+from jaxtyping import Array, Int, Float
 
 
 class NpyDataSource(g.RandomAccessDataSource):
@@ -51,34 +55,75 @@ class NpyDataSource(g.RandomAccessDataSource):
         return f"TokenWindows(n={len(self.paths)}, seq_len={self.seq_len}, total={len(self)})"
 
 
+@nnx.jit
+def train_step(
+    model: LLM,
+    optimizer: nnx.Optimizer,
+    x: Int[Array, "batch seq"],
+    cos: Float[Array, "seq d_head"],
+    sin: Float[Array, "seq d_head"],
+    y: Int[Array, "batch seq"],
+):
+    def loss_fn(m: LLM):
+        logits = m(x, cos, sin)
+        return optax.softmax_cross_entropy_with_integer_labels(
+            logits.astype(jnp.float32), y
+        ).mean()
+
+    loss, grads = nnx.value_and_grad(loss_fn)(model)
+    optimizer.update(model, grads)
+    return loss, optax.global_norm(grads)
+
+
+@nnx.jit
+def eval_step(
+    model: LLM,
+    x: Int[Array, "batch seq"],
+    cos: Float[Array, "seq d_head"],
+    sin: Float[Array, "seq d_head"],
+    y: Int[Array, "batch seq"],
+) -> Tuple[float, int]:
+    logits = model(x, cos, sin)
+    ce = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), y)
+    return ce.sum(), jnp.asarray(ce.size, jnp.float32)
+
+
 def train():
     batch_size = 16
     accum_steps = 16
     seq_len = 1024
     n_steps = 40_000
     checkpoint_every = 1_000
+    eval_every = 500
 
     CHECKPOINT_DIR = Path("./checkpoints/")
     RUNS_DIR = Path("./runs/")
 
-    test_src = NpyDataSource(
-        paths=list(Path("./datasets/fineweb-edu-sample-10BT/heldout").rglob("*")),
-        seq_len=seq_len,
-    )
-    test_ds = (
-        g.MapDataset.source(test_src)
-        .shuffle(seed=42)
+    meta = json.loads(Path("./datasets/fineweb-edu-sample-10BT/meta.json").read_text())
+    eval_bpt = meta["heldout_totals"]["bytes_per_token"]
+    n_windows = meta["totals"]["base_windows"]
+
+    eval_data = (
+        g.MapDataset.source(
+            NpyDataSource(
+                paths=list(
+                    Path("./datasets/fineweb-edu-sample-10BT/heldout").rglob("*")
+                ),
+                seq_len=seq_len,
+            )
+        )
         .map(lambda b: (b[:-1], b[1:]))
         .batch(batch_size=batch_size)
         .to_iter_dataset()
     )
 
-    src = NpyDataSource(
-        paths=list(Path("./datasets/fineweb-edu-sample-10BT/base").rglob("*")),
-        seq_len=seq_len,
-    )
-    ds = (
-        g.MapDataset.source(src)
+    train_data = (
+        g.MapDataset.source(
+            NpyDataSource(
+                paths=list(Path("./datasets/fineweb-edu-sample-10BT/base").rglob("*")),
+                seq_len=seq_len,
+            )
+        )
         .shuffle(seed=42)
         .repeat()
         .map(lambda b: (b[:-1], b[1:]))
@@ -122,9 +167,9 @@ def train():
         optax.adamw(schedule, b1=0.9, b2=0.95, weight_decay=0.1, mask=decay_mask),
     )
     tx = optax.MultiSteps(tx, every_k_schedule=accum_steps)
-    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+    optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)  # type: ignore
 
-    it = iter(ds)
+    it = iter(train_data)
     writer = SummaryWriter()
 
     with ocp.CheckpointManager(CHECKPOINT_DIR.absolute()) as mgr:
@@ -132,8 +177,17 @@ def train():
             x, y = next(it)
             loss, grad_norm = train_step(model, optimizer, x, cos, sin, y)
             if step % accum_steps == 0:
-                writer.add_scalar("loss", loss, step)
-                writer.add_scalar("grad_norm", grad_norm, step)
+                writer.add_scalar("train/loss", loss, step)
+                writer.add_scalar("train/grad_norm", grad_norm, step)
+            if step % (eval_every * accum_steps) == 0:
+                nats, toks = 0.0, 0.0
+                for i, (ex, ey) in enumerate(eval_data):
+                    n, t = eval_step(model, ex, cos, sin, ey)
+                    nats += float(n)
+                    toks += float(t)
+                bpb = (nats / np.log(2)) / (toks * eval_bpt)
+                writer.add_scalar("eval/loss", nats / toks, step)
+                writer.add_scalar("eval/bpb", bpb, step)
             if step % (checkpoint_every * accum_steps) == 0:
                 ckpt = {
                     "model": nnx.state(model),
@@ -145,6 +199,7 @@ def train():
 
 
 def load_checkpoint(path: Path):
+    # TODO: Update to match actual training loop
     cfg = ModelConfig(
         seed=0,
         vocab_size=24_576,
@@ -168,6 +223,12 @@ def load_checkpoint(path: Path):
         ],
         boundaries=[warmup, n_steps - decay],
     )
+
+    def decay_mask(state):
+        return jax.tree.map_with_path(
+            lambda path, _: "['kernel']" in jax.tree_util.keystr(path), state
+        )
+
     tx = optax.adamw(schedule, b1=0.9, b2=0.95, weight_decay=0.1, mask=decay_mask)
     model = LLM(cfg, nnx.Rngs(params=cfg.seed))
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
