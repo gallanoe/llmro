@@ -75,8 +75,6 @@ def main() -> None:
             [t.ids + [EOS] for t in tokenizer.encode_batch_fast(docs)]
         )
 
-    # bits-per-byte needs the true UTF-8 size of the eval text. Summing it here
-    # from the source avoids a whole decode pass later.
     heldout_bytes = 0
 
     for i, path in enumerate(shards):
@@ -95,10 +93,6 @@ def main() -> None:
                 batch["int_score"].to_pylist(),
                 batch["id"].to_pylist(),
             ):
-                # int_score, NOT the float `score` column. int_score is
-                # round(score), so >=4 captures everything from 3.5 up (13.89%
-                # of tokens). score >= 4.0 yields 2.16% -- an anneal pool 4.5x
-                # too small for the decay phase, and it fails silently.
                 if score >= 4:
                     split["anneal"].append(text)
                 elif is_heldout(doc_id):
@@ -107,8 +101,6 @@ def main() -> None:
                 else:
                     split["base"].append(text)
 
-            # At 0.1%, most batches contain zero heldout docs and
-            # np.concatenate([]) raises. The guard is required, not defensive.
             for pool in POOLS:
                 if split[pool]:
                     parts[pool].append(pack(split[pool]))

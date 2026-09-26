@@ -3,11 +3,13 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+import flax.linen as nn
 import orbax.checkpoint as ocp
 import grain.python as g
 from model import LLM, ModelConfig, rope_tables
 import json
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
@@ -55,6 +57,11 @@ class NpyDataSource(g.RandomAccessDataSource):
         return f"TokenWindows(n={len(self.paths)}, seq_len={self.seq_len}, total={len(self)})"
 
 
+OWG = nnx.variable_type_from_name(
+    nn.fp8_ops.OVERWRITE_WITH_GRADIENT, allow_register=True
+)
+
+
 @nnx.jit
 def train_step(
     model: LLM,
@@ -70,9 +77,14 @@ def train_step(
             logits.astype(jnp.float32), y
         ).mean()
 
-    loss, grads = nnx.value_and_grad(loss_fn)(model)
-    optimizer.update(model, grads)
-    return loss, optax.global_norm(grads)
+    diff = nnx.DiffState(0, nnx.Any(nnx.Param, OWG))
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff)(model)
+    optimizer.update(model, grads.filter(nnx.Param))
+    nnx.update(model, grads.filter(OWG))
+    # bfloat16
+    # loss, grads = nnx.value_and_grad(loss_fn)(model)
+    # optimizer.update(model, grads)
+    return loss, optax.global_norm(grads.filter(nnx.Param))
 
 
 @nnx.jit
@@ -88,20 +100,40 @@ def eval_step(
     return ce.sum(), jnp.asarray(ce.size, jnp.float32)
 
 
+CHECKPOINT_DIR = Path("./checkpoints/")
+RUNS_DIR = Path("./runs/")
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    seed: int
+    vocab_size: int
+    d_model: int
+    n_heads: int
+    d_hidden: int
+    n_layers: int
+
+    batch_size: int
+    accum_steps: int
+    seq_len: int
+    n_steps: int
+    checkpoint_every: int
+    eval_every: int
+
+
 def train():
     batch_size = 16
     accum_steps = 16
     seq_len = 1024
-    n_steps = 40_000
+    n_steps = 14_000
     checkpoint_every = 1_000
     eval_every = 500
 
-    CHECKPOINT_DIR = Path("./checkpoints/")
-    RUNS_DIR = Path("./runs/")
+    run_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    ckpt_dir = CHECKPOINT_DIR / run_id
 
     meta = json.loads(Path("./datasets/fineweb-edu-sample-10BT/meta.json").read_text())
     eval_bpt = meta["heldout_totals"]["bytes_per_token"]
-    n_windows = meta["totals"]["base_windows"]
 
     eval_data = (
         g.MapDataset.source(
@@ -131,7 +163,22 @@ def train():
         .to_iter_dataset()
     )
 
-    # Create model
+    anneal_data = (
+        g.MapDataset.source(
+            NpyDataSource(
+                paths=list(
+                    Path("./datasets/fineweb-edu-sample-10BT/anneal").rglob("*")
+                ),
+                seq_len=seq_len,
+            )
+        )
+        .shuffle(seed=42)
+        .repeat()
+        .map(lambda b: (b[:-1], b[1:]))
+        .batch(batch_size=batch_size)
+        .to_iter_dataset()
+    )
+
     cfg = ModelConfig(
         seed=0,
         vocab_size=24_576,
@@ -142,6 +189,10 @@ def train():
         dtype=jnp.bfloat16,
         param_dtype=jnp.float32,
     )
+    cos, sin = rope_tables(cfg, seq_len)
+    model = LLM(cfg, nnx.Rngs(params=cfg.seed))
+    nnx.bridge.lazy_init(model, jnp.zeros((1, seq_len), jnp.int32), cos, sin)
+
     peak_lr = 1e-3
     warmup = int(0.02 * n_steps)
     decay = int(0.12 * n_steps)
@@ -153,9 +204,6 @@ def train():
         ],
         boundaries=[warmup, n_steps - decay],
     )
-
-    cos, sin = rope_tables(cfg, seq_len)
-    model = LLM(cfg, nnx.Rngs(params=cfg.seed))
 
     def decay_mask(state):
         return jax.tree.map_with_path(
@@ -169,16 +217,55 @@ def train():
     tx = optax.MultiSteps(tx, every_k_schedule=accum_steps)
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)  # type: ignore
 
-    it = iter(train_data)
-    writer = SummaryWriter()
+    writer = SummaryWriter(logdir=str(RUNS_DIR / run_id))
 
-    with ocp.CheckpointManager(CHECKPOINT_DIR.absolute()) as mgr:
-        for step in tqdm(range(n_steps * accum_steps)):
+    with ocp.CheckpointManager(ckpt_dir.absolute()) as mgr:
+        # Base training
+        it = iter(train_data)
+        accum_loss, accum_grad_norm = 0.0, 0.0
+        for step in tqdm(range((n_steps - decay) * accum_steps)):
             x, y = next(it)
             loss, grad_norm = train_step(model, optimizer, x, cos, sin, y)
-            if step % accum_steps == 0:
-                writer.add_scalar("train/loss", loss, step)
-                writer.add_scalar("train/grad_norm", grad_norm, step)
+            accum_loss += loss
+            accum_grad_norm += grad_norm
+            if (step + 1) % accum_steps == 0:
+                writer.add_scalar("train/loss", accum_loss / accum_steps, step)
+                writer.add_scalar(
+                    "train/grad_norm", accum_grad_norm / accum_steps, step
+                )
+                accum_loss, accum_grad_norm = 0.0, 0.0
+            if step % (eval_every * accum_steps) == 0:
+                nats, toks = 0.0, 0.0
+                for i, (ex, ey) in enumerate(eval_data):
+                    n, t = eval_step(model, ex, cos, sin, ey)
+                    nats += float(n)
+                    toks += float(t)
+                bpb = (nats / np.log(2)) / (toks * eval_bpt)
+                writer.add_scalar("eval/loss", nats / toks, step)
+                writer.add_scalar("eval/bpb", bpb, step)
+            if step % (checkpoint_every * accum_steps) == 0:
+                ckpt = {
+                    "model": nnx.state(model),
+                    "opt": nnx.state(optimizer),
+                    "step": step,
+                    "grain": it.get_state(),
+                }
+                mgr.save(step, args=ocp.args.StandardSave(ckpt))
+
+        # Anneal training
+        it = iter(anneal_data)
+        accum_loss, accum_grad_norm = 0.0, 0.0
+        for step in tqdm(range((n_steps - decay) * accum_steps, n_steps * accum_steps)):
+            x, y = next(it)
+            loss, grad_norm = train_step(model, optimizer, x, cos, sin, y)
+            accum_loss += loss
+            accum_grad_norm += grad_norm
+            if (step + 1) % accum_steps == 0:
+                writer.add_scalar("train/loss", accum_loss / accum_steps, step)
+                writer.add_scalar(
+                    "train/grad_norm", accum_grad_norm / accum_steps, step
+                )
+                accum_loss, accum_grad_norm = 0.0, 0.0
             if step % (eval_every * accum_steps) == 0:
                 nats, toks = 0.0, 0.0
                 for i, (ex, ey) in enumerate(eval_data):

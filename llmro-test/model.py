@@ -1,5 +1,7 @@
 import os
 
+from jax.nn import initializers
+
 # MUST be set before jax initializes its allocator. Without this, XLA's default
 # BFC allocator cannot obtain more than ~4.6 GB of the 32 GB card under WSL2 --
 # it is not the driver (raw cuMemAlloc reaches 27 GB) and not the model.
@@ -13,6 +15,7 @@ import jax
 import optax
 import jax.numpy as jnp
 from flax import nnx
+import flax.linen as nn
 
 from typing import Optional, Tuple
 from jaxtyping import DTypeLike, Float, Int
@@ -109,36 +112,115 @@ def apply_rope(
     return x * cos + x_ort * sin
 
 
+# Custom Linear because they didn't port fp8 from Linen to NNX
+
+
+# Need custom variable type to not be counted as parameter
+class Fp8Meta(nnx.Variable):
+    """Scaling state: checkpointed with the model, ignored by nnx.Optimizer(wrt=nnx.Param)."""
+
+
+# TODO Later
+class Fp8Linear(nnx.Module):
+    def __init__(
+        self,
+        d_in: int,
+        d_out: int,
+        rngs: nnx.Rngs,
+        param_dtype=jnp.float32,
+        amax_history_len: int = 16,
+    ):
+        # Master weight: plain f32 Param. FP8 copies are made per call, never stored.
+        self.kernel = nnx.Param(
+            nnx.initializers.normal(0.02)(rngs.params(), (d_in, d_out), param_dtype)
+        )
+
+        # One scale + amax history per quantized tensor.
+        self.x_scale = Fp8Meta(jnp.ones((), jnp.float32))  # input activations (E4M3)
+        self.x_amax = Fp8Meta(jnp.zeros((amax_history_len,), jnp.float32))
+        self.w_scale = Fp8Meta(jnp.ones((), jnp.float32))  # kernel (E4M3)
+        self.w_amax = Fp8Meta(jnp.zeros((amax_history_len,), jnp.float32))
+        self.g_scale = Fp8Meta(jnp.ones((), jnp.float32))  # output gradient (E5M2)
+        self.g_amax = Fp8Meta(jnp.zeros((amax_history_len,), jnp.float32))
+
+    def __call__(
+        self, x: Float[Array, "batch seq din"]
+    ) -> Float[Array, "batch seq dout"]:
+        pass
+        # Quantize to fp8
+        # Rescale up
+
+
 # SwiGLU
 class SwiGLU(nnx.Module):
     def __init__(self, cfg: ModelConfig, rngs: nnx.Rngs):
-        self.u = nnx.Linear(
-            cfg.d_model,
-            cfg.d_hidden,
-            use_bias=False,
-            kernel_init=nnx.initializers.normal(0.02),
-            param_dtype=cfg.param_dtype,
-            dtype=cfg.dtype,
+
+        # bfloat16
+        # self.u = nnx.Linear(
+        #     cfg.d_model,
+        #     cfg.d_hidden,
+        #     use_bias=False,
+        #     kernel_init=nnx.initializers.normal(0.02),
+        #     param_dtype=cfg.param_dtype,
+        #     dtype=cfg.dtype,
+        #     rngs=rngs,
+        # )
+
+        self.u = nnx.bridge.ToNNX(
+            nn.Dense(
+                cfg.d_hidden,  # out features only; d_in is inferred
+                use_bias=False,
+                kernel_init=nnx.initializers.normal(0.02),
+                param_dtype=cfg.param_dtype,
+                dtype=cfg.dtype,
+                dot_general_cls=nn.fp8_ops.Fp8DirectDotGeneralOp,
+            ),
             rngs=rngs,
         )
 
-        self.g = nnx.Linear(
-            cfg.d_model,
-            cfg.d_hidden,
-            use_bias=False,
-            kernel_init=nnx.initializers.normal(0.02),
-            param_dtype=cfg.param_dtype,
-            dtype=cfg.dtype,
+        # bloatf16
+        # self.g = nnx.Linear(
+        #     cfg.d_model,
+        #     cfg.d_hidden,
+        #     use_bias=False,
+        #     kernel_init=nnx.initializers.normal(0.02),
+        #     param_dtype=cfg.param_dtype,
+        #     dtype=cfg.dtype,
+        #     rngs=rngs,
+        # )
+
+        self.g = nnx.bridge.ToNNX(
+            nn.Dense(
+                cfg.d_hidden,  # out features only; d_in is inferred
+                use_bias=False,
+                kernel_init=nnx.initializers.normal(0.02),
+                param_dtype=cfg.param_dtype,
+                dtype=cfg.dtype,
+                dot_general_cls=nn.fp8_ops.Fp8DirectDotGeneralOp,
+            ),
             rngs=rngs,
         )
 
-        self.d = nnx.Linear(
-            cfg.d_hidden,
-            cfg.d_model,
-            use_bias=False,
-            kernel_init=nnx.initializers.normal(0.02),
-            param_dtype=cfg.param_dtype,
-            dtype=cfg.dtype,
+        # bfloat16
+        # self.d = nnx.Linear(
+        #     cfg.d_hidden,
+        #     cfg.d_model,
+        #     use_bias=False,
+        #     kernel_init=nnx.initializers.normal(0.02),
+        #     param_dtype=cfg.param_dtype,
+        #     dtype=cfg.dtype,
+        #     rngs=rngs,
+        # )
+
+        self.d = nnx.bridge.ToNNX(
+            nn.Dense(
+                cfg.d_model,  # out features only; d_in is inferred
+                use_bias=False,
+                kernel_init=nnx.initializers.normal(0.02),
+                param_dtype=cfg.param_dtype,
+                dtype=cfg.dtype,
+                dot_general_cls=nn.fp8_ops.Fp8DirectDotGeneralOp,
+            ),
             rngs=rngs,
         )
 
@@ -154,13 +236,25 @@ class SwiGLU(nnx.Module):
 class Attention(nnx.Module):
     def __init__(self, cfg: ModelConfig, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.qkv_proj = nnx.Linear(
-            cfg.d_model,
-            3 * cfg.d_model,
-            use_bias=False,
-            kernel_init=nnx.initializers.normal(0.02),
-            param_dtype=cfg.param_dtype,
-            dtype=cfg.dtype,
+        # bloatf16
+        # self.qkv_proj = nnx.Linear(
+        #     cfg.d_model,
+        #     3 * cfg.d_model,
+        #     use_bias=False,
+        #     kernel_init=nnx.initializers.normal(0.02),
+        #     param_dtype=cfg.param_dtype,
+        #     dtype=cfg.dtype,
+        #     rngs=rngs,
+        # )
+        self.qkv_proj = nnx.bridge.ToNNX(
+            nn.Dense(
+                3 * cfg.d_model,
+                use_bias=False,
+                kernel_init=nnx.initializers.normal(0.02),
+                param_dtype=cfg.param_dtype,
+                dtype=cfg.dtype,
+                dot_general_cls=nn.fp8_ops.Fp8DirectDotGeneralOp,
+            ),
             rngs=rngs,
         )
         self.q_norm = nnx.RMSNorm(
@@ -169,13 +263,25 @@ class Attention(nnx.Module):
         self.k_norm = nnx.RMSNorm(
             cfg.d_head, param_dtype=cfg.param_dtype, dtype=cfg.dtype, rngs=rngs
         )
-        self.out_proj = nnx.Linear(
-            cfg.d_model,
-            cfg.d_model,
-            use_bias=False,
-            kernel_init=nnx.initializers.normal(0.02),
-            param_dtype=cfg.param_dtype,
-            dtype=cfg.dtype,
+        # bfloat16
+        # self.out_proj = nnx.Linear(
+        #     cfg.d_model,
+        #     cfg.d_model,
+        #     use_bias=False,
+        #     kernel_init=nnx.initializers.normal(0.02),
+        #     param_dtype=cfg.param_dtype,
+        #     dtype=cfg.dtype,
+        #     rngs=rngs,
+        # )
+        self.out_proj = nnx.bridge.ToNNX(
+            nn.Dense(
+                cfg.d_model,
+                use_bias=False,
+                kernel_init=nnx.initializers.normal(0.02),
+                param_dtype=cfg.param_dtype,
+                dtype=cfg.dtype,
+                dot_general_cls=nn.fp8_ops.Fp8DirectDotGeneralOp,
+            ),
             rngs=rngs,
         )
 
@@ -301,9 +407,6 @@ if __name__ == "__main__":
     batch = 8
     seq_len = 1024
 
-    # ONE fixed batch, drawn once and reused. The milestone is overfitting it.
-    # Re-drawing random tokens each step is unlearnable by construction and the
-    # loss would sit at ln(vocab) forever even with perfectly correct code.
     tokens = jnp.asarray(np.random.randint(0, cfg.vocab_size, (batch, seq_len + 1)))
     x = tokens[:, :-1]  # Everything but last
     y = tokens[:, 1:]  # Shift window by 1
