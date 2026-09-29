@@ -1,6 +1,6 @@
 # Per-Token Adaptive Depth for a Pretrained Hybrid LLM
 
-Retrofitting skip / run-once / run-twice routing onto Qwen3.5 with LoRA adaptation
+Retrofitting learned block bypasses and per-token routing onto Qwen3.5: findings to date and research plan
 
 ---
 
@@ -8,527 +8,520 @@ Retrofitting skip / run-once / run-twice routing onto Qwen3.5 with LoRA adaptati
 
 ### The idea
 
-Not every token needs the same amount of computation. After "sat on", predicting "the" is nearly free; the token that carries the answer to a math problem is not. Standard transformers still spend the same depth on both.
+Not every token needs the same amount of computation. Predicting a closing bracket or the next piece of a
+multi-token word is nearly free; the token that carries the answer to a math problem is not. Standard
+transformers still spend the same depth on both.
 
-This project adds **per-token adaptive depth** to a pretrained language model. The middle of the network is split into blocks, and for every token a small learned **router** chooses, per block, one of three actions:
+This project adds **per-token adaptive depth** to a pretrained language model without retraining it. The middle
+of the network is split into blocks. For every token, a small learned **router** decides, per block, whether the
+token runs the block normally or takes a cheap shortcut. The base model's weights stay frozen; only small added
+components are trained.
 
-- **skip:** the block is bypassed; the token's hidden state passes through unchanged
-- **keep:** the block runs once, as in the original model
-- **repeat:** the block runs twice, feeding its own output back in
+### What the experiments so far established
 
-Easy tokens can skip blocks to save compute. Hard tokens can repeat blocks to get more of it.
+Seven zero-shot experiments on Qwen3.5-0.8B (no model training) shaped the design:
 
-### Why retrofit instead of training from scratch
+1. **The premise holds.** On the model's own generated text, about half of all tokens tolerate less computation
+   with essentially no change to their prediction. Tolerance tracks how confident the model is.
+2. **A router can see it early.** The hidden state after the first block predicts which tokens can take
+   shortcuts (AUROC 0.93 with a small MLP), well beyond token identity alone.
+3. **The main obstacle is contamination.** If a token simply skips a block, its hidden state enters every later
+   layer under-processed, and its cache writes there are off. Every other token reads those writes. Most routing
+   damage lands on tokens that skipped nothing, through the shared caches, overwhelmingly the recurrent state of
+   the linear-attention (DeltaNet) layers.
+4. **Fixing the cause works better than fixing the symptom.** Linear corrections to the corrupted cache writes
+   recovered only about a quarter of the damage at a realistic size. Replacing "skip" with a **bypass**, a
+   ~2M-parameter MLP that predicts what the block would have done to the token's hidden state, halves the damage
+   at about 2% of a block's compute.
 
-Architectures with adaptive or recurrent depth (looped transformers, Mixture-of-Recursions, Mixture-of-Depths) are usually trained from scratch, and the literature suggests training the capability in from the start beats bolting it onto an existing model. Training from scratch is out of reach on a single GPU. The central hypothesis here is that **LoRA adaptation can substitute for from-scratch training**: small trainable corrections, placed exactly where routing pushes a layer off its usual input distribution, can let a pretrained model tolerate skipping and repeating.
+### Current design in one paragraph
 
-Whether LoRA alone is enough is treated as something to measure, not assume (see the capacity ladder in §3.8).
+Qwen3.5-0.8B stays frozen. Its four middle blocks are routable. Per token, a router reading the first block's
+output chooses, for each routable block, **keep** (run it) or **bypass** (run a small learned approximation of
+it). Tokens that bypass a block still write that block's cache entries from their unchanged hidden state, so the
+cache is always dense. The bypasses, a set of small cache-write adapters, and eventually the router are trained
+end to end to match the stock model's predictions under real per-token execution.
 
-### Two goals
+### Goals
 
 | Track | Goal | Compute budget |
 |---|---|---|
 | **E: efficiency** | Same quality, fewer blocks per token | Below the native 6 blocks per token |
-| **Q: quality** | Better answers, same compute | Exactly 6 blocks per token on average; repeats must be paid for by skips |
+| **Q: quality** | Better answers, same compute | 6 blocks per token on average, with repeats paid for by bypasses |
 
-### What makes this design distinctive
-
-1. **Hybrid-attention base model.** Qwen3.5 interleaves linear-attention (Gated DeltaNet) layers with full-attention layers. Routing is done at the granularity of one interleave group, so every block ends in a full-attention layer.
-2. **Dense cache via shadow writes.** A token that skips a block still writes that block's cache entries, computed cheaply from its unchanged hidden state. Later tokens never find gaps in the cache.
-3. **Native equivalence by construction.** When every token keeps every block, the model is exactly the base model: all adapters are gated off, and the base model doubles as the distillation teacher.
+Track E is the current focus. Track Q depends on an unresolved question: whether running a block twice can help
+at all (§4.6).
 
 ### Related work
 
-- **Per-input layer programs on frozen models:** CoLa (Li et al., 2025) showed that skipping and repeating pretrained layers per input can both shorten computation and fix wrong answers. DR.LLM (Heakl et al., 2025) and POLAR (ICML 2026) train routers for this with frozen layers. POLAR found that predicting the whole program up front beats deciding layer by layer, and that useful programs are mostly contiguous segments of one to four layers.
-- **Adaptive depth trained from scratch:** Mixture-of-Depths (Raposo et al., 2024), Mixture-of-Recursions (Bae et al., 2025), Ouro (Zhu et al., 2025), Huginn (Geiping et al., 2025).
+- **Per-input layer programs on frozen models:** CoLa (Li et al., 2025) showed that skipping and repeating
+  pretrained layers per input can shorten computation and fix wrong answers. DR.LLM (Heakl et al., 2025) and POLAR
+  (ICML 2026) train routers over such programs with frozen layers. POLAR found that predicting the whole program
+  up front beats deciding layer by layer.
+- **Adaptive or recurrent depth trained from scratch:** Mixture-of-Depths (Raposo et al., 2024),
+  Mixture-of-Recursions (Bae et al., 2025), Ouro (Zhu et al., 2025), Huginn (Geiping et al., 2025).
 - **Early exit:** CALM (Schuster et al., 2022), LayerSkip (Elhoushi et al., 2024).
-- **Converting pretrained models to recursive ones:** Relaxed Recursive Transformers (Bae et al., 2024) converted Gemma into a looped model with layer-wise LoRA. Their conversion used 15–60B tokens of full-parameter uptraining in addition to LoRA.
-- **Layer roles:** middle layers are robust to deletion and reordering while the first and last layers are fragile (Lad, Gurnee & Tegmark, 2024; Gromov et al., 2024). This motivates keeping the first and last blocks fixed.
+- **Converting pretrained models to recursive ones:** Relaxed Recursive Transformers (Bae et al., 2024), which
+  used 15–60B tokens of full-parameter uptraining plus layer-wise LoRA.
+- **Cache problems under adaptive depth:** CHASE trains looped models to tolerate cache holes left by early exit;
+  MELT (Vendrell et al., 2026) trains a shared, gated cache across loops.
+- **Layer roles:** middle layers are robust to deletion and reordering while the first and last layers are fragile
+  (Lad, Gurnee & Tegmark, 2024; Gromov et al., 2024).
 
 ---
 
-## 2. Design
+## 2. Findings to date
 
-### 2.1 Base model: Qwen3.5-0.8B
+All experiments use Qwen3.5-0.8B in bf16 with no weights trained, teacher-forced evaluation, and **damage**
+measured as KL(stock ‖ modified) over the full vocabulary, in nats per token. Unless stated, test numbers are on a
+held-out split of 38 sequences (59,740 positions): 22 of the model's own thinking-mode generations ("selfgen"),
+8 math generations, and 8 WikiText passages. Intervals, where given, are 95% sequence-level bootstraps.
 
-| Property | Value |
+### 2.1 Headline progression
+
+Damage at about 5 blocks per token (stock uses 6), under two routers. "Old" is a probe trained on whole-sequence
+labels (§2.3); "clean" is a probe trained on clean labels (§2.6).
+
+| Condition | Old router | Clean router |
+|---|---|---|
+| Simulated (per-token damage looked up from whole-sequence runs) | 0.083 | — |
+| **Real per-token routing, plain skip** | **0.161** | **0.153** |
+| Plain skip + best realistic linear write correction (rank 32, DeltaNet) | 0.139 | — |
+| **Real per-token routing, bypass (MLP, hidden 1024)** | **0.072** | **0.067** |
+| Oracle bypass (exact per-token block output; in-block writes still shadows) | 0.030 | 0.034 |
+| Plain skip, every cache write replaced with the stock model's | 0.047 | 0.011 |
+| Bypass, every cache write replaced with the stock model's | 0.016 | 0.007 |
+| Static reference: skip B2 for every token (cost 5.0) | 0.280 | 0.280 |
+
+The last three rows use the stock model's cache writes, which aren't available at inference; they are ceilings,
+not achievable results.
+
+### 2.2 Block tolerance (experiment 001)
+
+Each block skipped or repeated for every token (WikiText):
+
+- **B0 and B5 are untouchable.** Skipping either sends perplexity from 23.4 to roughly 26,000–55,000. Even
+  repeating them costs about 2 nats of KL.
+- **B1–B4 tolerate skipping:** KL 0.22–1.07, perplexity 28–72. B2 is cheapest, B4 most expensive.
+- **Repeats barely hurt** (KL 0.1–0.2), but no repeat beats stock on average.
+
+### 2.3 Per-token tolerance (experiment 002)
+
+All 81 skip/keep/repeat plans over B1–B4, each applied to a whole sequence, with per-token damage recorded:
+
+- At a tolerance of 0.05 nats, **47% of selfgen tokens** tolerate a cheaper plan; the average cheapest sufficient
+  plan costs 5.01 blocks. Human-written text is much less compressible (WikiText: 80% of tokens need all 6 blocks).
+- **Cheapness tracks confidence:** tokens with stock next-token entropy below 0.01 nats average about 3.5 blocks;
+  above 1 nat, nearly 6.
+- Cheap token types: punctuation, word continuations, digits. Content-word starts and function words are expensive.
+- **Repeats add nothing to efficiency:** restricting to skip/keep gives average cost 5.02 vs. 5.01 with all plans.
+- Block decisions are mildly dependent (total correlation 0.18 nats against a joint entropy of about 2 nats),
+  strongest between adjacent blocks.
+- **Generation problem:** at an 8,192-token budget, 45 of 50 math generations and 78 of 150 general generations
+  never finished and ended in verbatim loops. Only 5 of 50 math problems were solved.
+
+These whole-sequence damage tables turned out to be poor labels for real per-token routing (§2.4–§2.6).
+
+### 2.4 Can a router see tolerance early? (experiment 003)
+
+Probes on hidden states, predicting per-token tolerance from experiment 002:
+
+- From the **output of B0** (layer 3), a small MLP reaches AUROC 0.93 for "some cheaper plan is free"; token
+  identity alone reaches 0.78–0.80.
+- A simulated router built from a probe predicting damage per plan closes 65% of the gap between the best static
+  plan and a perfect per-token oracle at 5 blocks per token.
+- Reading one block later (layer 7) helps only slightly (68%) and would forfeit routing B1. The router stays after B0.
+- Reading the layer-3 state through the output layer ("logit lens") is useless (AUROC 0.62) and costs 1.6× a block.
+
+### 2.5 Real per-token routing and contamination (experiments 004, 005)
+
+**Real routing (004).** Per-token plans, with **shadow writes**: a token that skips a block still writes that
+block's cache entries from its unchanged hidden state, so later tokens never find gaps.
+
+- Real damage is about **twice the simulated value** (0.161 vs. 0.083 at 5 blocks), though still well below
+  skipping B2 for everyone (0.280).
+- **Tokens that skipped nothing are hurt** (0.153 vs. 0 in simulation). Tokens that skipped do about as well as
+  simulated.
+- Perfect per-token choices from the whole-sequence tables fall from 0.008 simulated to 0.147 real.
+
+**Which writes carry the damage (005).** Selectively replacing cache writes with the stock model's:
+
+- Replacing only **deviated tokens'** writes (tokens that skipped something at or before that layer) removes about
+  **70%** of the damage (0.161 → 0.047). Tokens that kept every block then have exactly zero damage.
+- **Downstream writes** (in blocks run after a skip) matter more than the skipped block's own shadow writes.
+- **DeltaNet writes dominate:** fixing only those removes 0.089, versus 0.027 for attention writes. DeltaNet's
+  recurrent state blends every token's writes into one running summary, so a bad write can't be ignored later.
+- Once deviated tokens' writes are native, everyone else's are automatically native too. The fix only needs to
+  target deviated tokens.
+- In a clean context, skipping is far cheaper than whole-sequence measurements suggested: skipping B2 for every
+  token costs about 0.04 instead of 0.25 on a sample sequence.
+
+### 2.6 Linear write corrections and clean labels (experiment 006)
+
+**Write corrections.** Closed-form, low-rank linear maps from a deviated token's actual input to the stock model's
+write, applied where a LoRA on the write projections would act:
+
+- At a realistic size (rank 32 per layer and role, 6.3M parameters), they close **25%** of the DeltaNet-fixable
+  damage at 5 blocks and 16% at 4.5.
+- Even a full-rank correction per skip pattern (646M parameters, nearly the decoder's size) closes only 46%; fit
+  in-sample on the test data itself, 65%. **Native writes aren't a linear function of the drifted hidden state.**
+- Corrections must act wherever a LoRA would, including the token's own computation. Correcting only what others
+  read makes skipping tokens worse.
+
+**Clean labels.** With every cache write native, a token's damage depends only on its own plan:
+
+- Skipping B1 or B2 is nearly free (0.076 and 0.056); skipping B3 or B4 is not (0.39–0.48).
+- The average cheapest sufficient plan drops to 4.16 blocks on selfgen and 3.95 on math.
+- A probe retrained on these labels routes far better in a clean context: 0.011 damage at 5.1 blocks.
+  Simulation and real execution match exactly in that setting.
+
+### 2.7 Block bypasses (experiment 007)
+
+Replacing "skip" (identity) with a small per-token map predicting the block's residual update,
+`h_out ≈ h_in + f(h_in)`, fitted on stock pairs:
+
+- **Best bypass:** an MLP with hidden size 1024, about 2.1M parameters per block (2.3% of a block's matmul FLOPs).
+  It reduces damage at ~5 blocks per token from 0.161 to **0.072** (old router) and from 0.153 to **0.067** (clean
+  router); at ~4.6 blocks, from 0.32–0.36 to 0.15–0.17. The NLL gap to stock halves (+0.18 → +0.09) and top-1
+  agreement rises from 0.87 to 0.91.
+- **Fit quality predicts damage:** across families, damage falls steadily as the bypass explains more of the block's
+  update. The best bypass explains 61%. Low-rank linear bypasses (rank 16) are worse than skipping.
+- **Headroom remains:** an oracle bypass (exact block output per token) reaches 0.030–0.034. Refitting linear
+  bypasses on the inputs tokens actually carry during routing helps under the clean router (0.081 → 0.073).
+- **Mostly a contamination fix:** nearly all of the bypass's benefit is reduced harm to other tokens. About 0.06 of
+  contamination remains at 5 blocks. About half of it is the skipped block's own shadow writes, which even a
+  perfect bypass leaves in place; the rest is bypass error carried downstream.
+- Chaining four per-layer linear maps (to improve in-block writes) was worse than one block-level map.
+- Restricting routing to B1 and B2 is worse than routing over all four blocks at every matched cost.
+- Per-token routing adds value on top of the bypass: bypassing B2 for every token costs 0.134, versus 0.067 for
+  per-token routing at the same compute.
+- A router retrained on bypass labels from whole-sequence runs was not better (0.082); those labels again
+  predicted about half the real mixed-plan damage.
+
+### 2.8 What the findings imply
+
+- **"Skip" should mean "run a learned bypass."**
+- **Labels from whole-sequence runs are unreliable** for real per-token routing: they ignore how plans interact
+  through the caches. The router ultimately has to be trained under real mixed execution.
+- **Remaining damage** comes from in-block shadow writes and bypass error. Both are targets for training.
+- **Efficiency upside at 0.8B is modest.** The output layer (248k-word vocabulary, tied with the embeddings) reads
+  about 0.5 GB per token, versus about 1 GB for all six blocks. Saving one block per token cuts weight reads by
+  roughly a tenth before bypass overhead. The efficiency case rests mainly on larger models, where the output
+  layer is a smaller share.
+
+---
+
+## 3. Design
+
+### 3.1 Base model
+
+| Property | Qwen3.5-0.8B |
 |---|---|
-| Layers | 24, arranged as 6 × [Gated DeltaNet ×3 → gated full attention] |
+| Layers | 24, as 6 × [Gated DeltaNet ×3 → gated full attention] |
 | Hidden size | 1024 |
-| Full attention | 8 query heads, 2 KV heads, head dimension 256 (rotary on 64 dims), sigmoid output gate |
-| Gated DeltaNet | 16 heads, head dimension 128 |
+| Full attention | 8 query heads, 2 KV heads, head dimension 256, sigmoid output gate |
+| Gated DeltaNet | 16 heads, head dimension 128; fixed-size recurrent state plus short-convolution state |
 | FFN | SwiGLU, intermediate size 3584 |
-| Vocabulary | 248,320, input and output embeddings tied |
-| Parameters | ~0.8B total: ~0.25B embeddings, ~0.5B in the 24 layers (~85M per 4-layer block) |
+| Vocabulary | 248,320, embeddings tied with the output layer |
+| Parameters | ~0.8B: ~0.25B embeddings, ~83M per 4-layer block |
 
-The model is loaded text-only (no vision encoder) with the multi-token-prediction head disabled. Qwen3.5-2B has the same 24-layer, interval-4 layout, so it is the natural second rung of the size ladder.
+Loaded text-only (no vision encoder), multi-token-prediction head disabled, weights frozen. Qwen3.5-2B has the same
+24-layer layout and is the second rung of the size ladder.
 
-### 2.2 Blocks and routing plans
+### 3.2 Blocks and plans
 
-The 24 layers form six blocks, B0–B5, each one [DeltaNet, DeltaNet, DeltaNet, full attention] group.
+- Six blocks B0–B5, each one [DeltaNet, DeltaNet, DeltaNet, attention] group: B0 = layers 0–3, B1 = 4–7,
+  B2 = 8–11, B3 = 12–15, B4 = 16–19, B5 = 20–23.
+- **B0 and B5 always run.** B1–B4 are routable.
+- **Track E actions:** keep or bypass, giving 16 plans per token. Cost = blocks executed = 2 + number kept, from 2
+  to 6. Bypass cost is reported separately.
+- **Track Q actions** (if pursued): keep, bypass, or repeat (run twice, at most once per block).
 
-- **B0 and B5 are fixed.** Every token always runs them once. The first and last layers of a transformer do specialized work (turning tokens into features, turning features into predictions) and are fragile under perturbation.
-- **B1–B4 are routable.** Each takes one of three actions per token: skip, keep, or repeat (at most one repeat).
+### 3.3 Bypass
 
-A **routing plan** for one token is four actions, one per routable block. There are 3⁴ = **81 possible plans per token**. The number of block executions per token ranges from 2 (skip all four) to 10 (repeat all four); the native model uses 6.
-
-| Block executions | 2 | 3 | 4 | 5 | **6** | 7 | 8 | 9 | 10 |
-|---|---|---|---|---|---|---|---|---|---|
-| Number of plans | 1 | 4 | 10 | 16 | **19** | 16 | 10 | 4 | 1 |
-
-Execution for one token:
-
-```
-h ← B0(h)
-for j in 1..4:
-    skip:    h ← h
-    keep:    h ← Bj(h)
-    repeat:  h ← Bj′(Bj(h))      # Bj′ = second pass: same weights as Bj (plus repeat adapters), own cache slot
-h ← B5(h)
-logits ← LMHead(h)
-```
-
-### 2.3 The cache: ten static slots with shadow writes
-
-Each block execution needs its own cache: one full-attention KV cache and three DeltaNet recurrent states (each with a short-convolution state). A repeat pass reads and writes separately from the first pass, because its inputs, and therefore its keys, values, and states, differ.
-
-**Static layout.** The cache always has 10 slots, one per possible block visit:
+For routable block j with input `h_in`:
 
 ```
-B0 | B1 | B1′ | B2 | B2′ | B3 | B3′ | B4 | B4′ | B5
+h_out ≈ h_in + f_j( h_in / rms(h_in) )
+f_j(x) = W₂ · SiLU(W₁ x + b₁) + b₂        # hidden size 1024, W₂ zero-initialized
 ```
 
-Every sequence has the same cache shape regardless of routing, which keeps batching simple.
+- About 2.1M parameters per block; about 2.3% of a block's matmul FLOPs.
+- Initialized by regression on the block's stock residual update, then trained end to end (§4.3).
+- **Limitation:** a real block mixes information across tokens; a bypass sees only the token's own state. It
+  captures the part of the block's effect that is predictable per token.
 
-**Every token writes every slot.** This is the key design choice. With per-token routing, a later token that runs block j needs every earlier token's entry at block j, including tokens that skipped it. Each visit is therefore one of two kinds:
+### 3.4 Cache
 
-- **Full visit:** the block runs normally. It updates the hidden state and writes its cache entries.
-- **Shadow write:** the block is skipped. The hidden state passes through unchanged, but the token still computes the slot's cache entries from that unchanged hidden state, using only the cheap projections:
-  - full-attention layer: K and V
-  - DeltaNet layers: q, k, v, the short convolution, the write strength β, the decay α, and the recurrent state update
+- One slot per block: the attention layer's KV cache plus three DeltaNet recurrent and convolution states. Track E
+  uses 6 slots. With repeats, a second slot per routable block is added (10 in total).
+- **Every token writes every slot.** A kept block writes normally. A bypassed block gets **shadow writes**: the
+  token computes that block's cache entries from its unchanged input `h_in`, using only the cheap projections
+  (K/V for attention; q, k, v, convolution, write strength β, decay, and state update for DeltaNet).
+- After a bypass, the token continues from `h_in + f(h_in)`, and its later writes come from that state.
+- Shadow writes are exact at each block's first layer and approximate at layers 2–4.
+- **Memory:** 12 KB of attention KV per token for the stock layout, plus ~19 MB of fixed DeltaNet state per sequence.
 
-  The expensive parts (attention readout, output projection, FFN) are skipped. A shadow write costs roughly a quarter of a block.
+### 3.5 Router
 
-Repeat slots follow the same rule. A token that does not repeat block j writes shadow entries into slot Bj′, computed from its hidden state after Bj.
+- **Input:** each token's hidden state after B0.
+- **Current form:** a small MLP (hidden size 256) predicting damage, `log(KL + 1e-4)`, for each of the 16 plans.
+  Each token takes `argmin(predicted damage + λ · cost)`. λ sets the compute budget and can be changed at inference
+  without retraining.
+- **Initialization:** trained on clean labels (each plan's damage with all cache writes native), which gave the
+  best real results so far.
+- **Final training under real execution** (open decision, §4.4):
+  - (a) **Joint straight-through Gumbel training** with per-block keep/bypass heads, made sequential so each head
+    sees earlier blocks' choices. Because the bypass branch is cheap, computing both branches per block during
+    training costs little more than the keep path.
+  - (b) **Iterative relabeling:** measure damage under the current policy's mixed execution and refit the
+    damage-predicting router.
+- Compute the router in fp32, or add a small decision margin: in token-by-token decoding, bf16 noise flipped about
+  0.5% of decisions.
 
-**Shadow writes are exact for the first layer of each block.** That layer's input is the block's input whether the block runs or not. Layers 2–4 see an input missing the earlier layers' processing, so their shadow entries are approximations. Shadow adapters (§2.5) correct them.
+### 3.6 Adapters
 
-**One useful consequence:** when every token uses the same plan, nobody reads the shadow entries, so the design reduces exactly to per-sequence routing. The frozen-model measurements in §3.3 rely on this.
+All zero-initialized, all inactive on native visits, so the all-keep plan is exactly the stock model.
 
-**Memory**
-
-| Configuration | Attention KV per token | Fixed DeltaNet state per sequence |
-|---|---|---|
-| Stock Qwen3.5-0.8B (6 attention layers) | 12 KB | ~19 MB |
-| Static 10-slot design (10 attention layers) | 20 KB | ~31 MB |
-
-Hybrid models have very small caches: a dense model like Llama-3-8B uses about 128 KB per token. Below roughly 1.5k tokens, the fixed DeltaNet state is the larger share.
-
-**Excluded: sharing one cache slot between a block and its repeat.** Looped-transformer work sometimes shares one KV cache across passes. Huginn tolerates it zero-shot; Ouro collapses under it unless trained for it (MELT; Vendrell et al., 2026). Here it would save only 8 KB per token (20 KB back to 12 KB). It would also break native equivalence, since every token's context would change whenever any token repeats, and it adds a confound when interpreting results. It is out of scope.
-
-### 2.4 Router
-
-- **Input:** each token's hidden state after B0. B0's attention is causal, so the router only uses context up to and including the current token.
-- **Architecture:** a two-layer MLP (hidden size 256) with four heads of three logits each (skip, keep, repeat per routable block).
-- **Initialization:** strongly biased toward keep, so training begins at exactly the base model's behavior.
-- **Training: straight-through Gumbel-softmax.** For each token and block, sample a hard choice with Gumbel noise and use it in the forward pass. In the backward pass, use the gradient of the soft (temperature-τ) sample. Computing that gradient requires all three branches' outputs, so during training every routable block computes skip, keep, and repeat for every token:
-
-  ```
-  h_out = y_skip·h + y_keep·B(h) + y_repeat·B′(B(h))
-  ```
-
-  In the forward pass only one term is nonzero. In the backward pass, each option's logit moves according to how its branch would have changed the loss.
-- **Inference:** no noise; argmax per head; only the chosen branch runs.
-- **Optional warm start** from frozen-model labels (§3.3).
-
-### 2.5 Adapters
-
-All adapters are LoRA modules with zero-initialized up-projections, so each starts as a no-op. All are gated off on native visits, which is why the all-keep plan equals the base model exactly.
-
-There are three kinds of off-native computation, each with its own adapter type:
-
-| Type | When it applies | What is off-distribution | Scope |
+| Component | Where | Purpose | Status |
 |---|---|---|---|
-| **Jump** | Full visit to the first layer of a block entered right after a skipped block | Input is missing one or more blocks of processing | All linear layers of that layer |
-| **Repeat** | Full visit on the second pass through a block | Input has already been through this block | All linear layers of the block |
-| **Shadow** | Shadow writes, layers 2–4 of a block | Projections see an unrefined hidden state, **and other tokens read the result** | Only the matrices used for cache writes |
+| **Bypass MLP** | Replaces a bypassed block's residual update | Keeps the token's own state, and therefore its later writes, close to native | Core |
+| **Shadow-write adapter** | Write projections of layers 2–4 of a bypassed block, rank ~32 | Reduces the in-block shadow-write contamination that remains even with a perfect bypass | To test (experiment 008) |
+| **Downstream write adapter** | Write projections in blocks run after a bypass | Residual downstream contamination | Low priority: linear versions were weak |
 
-**Soft gating during training.** Under straight-through Gumbel, gates are hard in the forward pass and soft in the backward pass:
+**Local targets are free.** The teacher pass (the same frozen model, all blocks kept, adapters off) computes every
+token's stock hidden states and cache writes, which gives direct regression targets for bypasses and write adapters
+in addition to the end-to-end loss.
 
-- The jump adapter's delta is scaled by the probability that the previous block was skipped for this token.
-- The repeat adapter is active on the repeat branch, scaled by `y_repeat`.
-- For shadow writes, the gate applies to *which entry is written*: `y_skip · shadow + (1 − y_skip) · full`. The shadow LoRA is always active inside the write-only computation itself.
-
-At inference every gate is exactly 0 or 1.
-
-**Adapter variants** (compared in §3.6):
-
-| ID | Name | Full-visit adapters | Shadow adapters |
-|---|---|---|---|
-| V1 | Block LoRA | One LoRA per routable block, on for any off-native visit (jump or repeat) | None |
-| V2 | Block LoRA + Shadow | As V1 | One per block, layers 2–4 |
-| V3 | Typed LoRA + Shadow | Separate jump and repeat LoRAs per block (8 sets: B1 repeat only, B2–B4 both, B5 jump only) | One per block, layers 2–4 |
-
-Shadow adapters are shared between a block's normal slot and its repeat slot. They are split only if their imitation losses diverge.
-
-### 2.6 Shadow adapter training
-
-**Which matrices**
-
-| Layer in block | Shadow LoRA | Matrices |
-|---|---|---|
-| 1 (DeltaNet) | None; already exact | none |
-| 2, 3 (DeltaNet) | Yes | Input projections for q, k, v, β, α (fused in the reference implementation) |
-| 4 (full attention) | Yes | K and V projections |
-
-That is 12 shadow adapters (4 routable blocks × layers 2–4). At rank 32 they total about 3M parameters.
-
-**Two training signals**
-
-1. **Local imitation loss.** Because training computes all three branches for every token, the entries a real visit *would* have written are always available. The shadow learns to match them:
-
-   ```
-   shadow write:  K̃ = (W_k + ΔW_k) · norm(h_block_input)
-   real write:    K  =  W_k · norm(h_layer_input)        # from the keep (or repeat) branch
-
-   L_shadow = Σ_layers normalized_error(shadow_write, stopgrad(real_write))
-   ```
-
-   - Error measure: cosine distance for unit-normalized vectors (DeltaNet q and k); variance-normalized MSE for values; MSE on pre-sigmoid β and α. Attention keys are compared after their normalization, i.e., as stored.
-   - `stopgrad` on the target keeps the real path from being pulled toward the shadow.
-   - The shadow's input is detached for this loss, so it trains only the shadow LoRA and never pushes upstream layers.
-   - It is computed for **all tokens**, not only those that skipped. This gives far more training data and keeps shadows accurate as router decisions shift.
-
-2. **End-to-end signal.** Shadow entries are read by later tokens, so the main distillation loss backpropagates through those reads into the shadow LoRA. This teaches what readers actually need, which may differ from exact imitation.
-
-**Schedule**
-
-1. **Closed-form initialization.** On a calibration batch with everything running natively, fit the least-squares linear map from block input to real write for each layer, then truncate the difference from the original weights to rank 32 with SVD. A LoRA is exactly a low-rank linear correction, so this is the optimal starting point for the local objective.
-2. **Pre-fit.** Train only the shadow LoRAs on the local loss for 10–20M tokens with the router off and everything native. This needs no Gumbel branches and is cheap.
-3. **Joint training.** Both signals stay active while the compute budget drops.
-
-### 2.7 Training objective
+### 3.7 Training objective
 
 ```
-L = KL(native ‖ routed)                       # match the base model, every token
-  + λ · (E[compute] − budget)                  # budget constraint, λ adjusted automatically
-  + μ · L_shadow                               # shadow imitation, μ = 0.1
-  [+ CE on verified reasoning traces]          # Track Q only
+L = KL(stock ‖ routed)                        # every token, under real per-token execution with shadow writes
+  + λ_budget · (E[cost] − budget)             # when the router is trained; λ_budget by dual ascent
+  + μ · L_local                               # optional regression of bypass outputs and writes to stock targets
+  [+ CE on verified reasoning traces]         # Track Q only
 ```
 
-- **Teacher:** the same model with all adapters off and every block kept, run without gradients. No second copy of the weights is needed.
-- **Expected compute** per token: `E[compute] = 2 + Σ_j (p_keep,j + 2·p_repeat,j)`, in block executions (the 2 counts B0 and B5).
-- **Budget enforcement:** a Lagrange multiplier updated by dual ascent: `λ ← max(0, λ + η·(Ē − budget))` for Track E, two-sided for Track Q. The budget becomes a constraint rather than a weight to tune.
+The teacher needs no second copy of the weights: it is the same model with adapters disabled and every block kept.
 
-### 2.8 Efficiency ceiling at 0.8B
+### 3.8 Excluded, and why
 
-The output layer (248,320 × 1024, tied with the embeddings) reads about 0.5 GB per generated token in bf16, compared with about 1 GB for all six blocks. Even if every token skips all four routable blocks, and shadow writes still happen, bytes read per token fall by only about a third. The ceiling rises with model size, as the output layer becomes a smaller share of the weights.
+| Idea | Reason |
+|---|---|
+| Plain skipping (identity) | Contamination; the bypass halves damage at ~2% of a block's compute |
+| Linear write correction as the main fix | Native writes aren't linearly recoverable (25% at rank 32, <50% at any size) |
+| Sharing one cache slot between a block and its repeat | Saves only 8 KB per token here, breaks native equivalence, and pretrained models collapse under it unless trained for it |
+| Routing only B1 and B2 | Worse than routing all four blocks at every matched cost |
+| Repeats for Track E | Add nothing to efficiency |
+| Logit lens as router input | Uninformative and more expensive than a block |
+| Router labels from whole-sequence runs | Underpredict real mixed-plan damage by about 2× |
 
 ---
 
-## 3. Plan
+## 4. Plan
 
-### 3.1 Scope
+### 4.1 Status
 
-- **Thinking mode is enabled throughout:** training data generation, training, and evaluation. Final models also get one evaluation pass with thinking disabled. That costs evaluation time only; no extra training runs.
-- **No success thresholds are pre-registered.** The study is exploratory, and all results are reported.
-- **Out of scope for now:**
-  - KV-cache sharing between passes (§2.3)
-  - Comparisons against other methods, such as static layer pruning with LoRA healing
-  - A router-only arm with frozen layers (the frozen-model measurements in §3.3 serve as the no-adaptation reference)
+Frozen-model investigation is complete (experiments 001–007). The next phase is training small components with
+the base model frozen.
 
-### 3.2 Steps
+### 4.2 Unblock training data (priority)
 
-| Step | Work | Output | Estimated time |
-|---|---|---|---|
-| 0 | Environment setup: PyTorch, transformers with Qwen3.5 support, flash-linear-attention and causal-conv1d (verify Blackwell support), vLLM. Load the model text-only, MTP off. Measure real generation and training throughput. | Working environment; real speed numbers that replace every estimate below | ~1 day |
-| 1 | Build the modified model: blocks, 10-slot cache, shadow writes, plan execution in all three modes. Pass the core tests (§4.4). | A model that runs any routing plan | ~1 week |
-| 2 | Build and freeze the evaluation set; score the base model | Frozen eval set and baselines | 2–4 days |
-| 3 | Frozen-model measurements (§3.3) | Headroom estimates, per-token map, warm-up labels. **Decision point.** | A few days |
-| 4 | Generate training data (§3.4) | Broad set, verified reasoning set | 1–2 days, overlaps step 5 |
-| 5 | Build training: router, adapters, losses, schedules, shadow pre-fit; smoke test on a few million tokens | A validated training loop | ~1 week |
-| 6 | Staged experiments (§3.6) | Trained routers and adapters | ~2 weeks of GPU time |
-| 7 | Evaluation and analysis (§3.5) | Results | A few days |
-| 8 | Rerun the winning settings on Qwen3.5-2B; then choose a larger model | Scaling evidence | 1–2 weeks |
+End-to-end training needs far more text than the ~400k tokens used so far, and thinking-mode generation at 0.8B is
+unstable.
 
-Total: roughly 6–8 weeks for 0.8B through 2B. Most of the uncertainty is in step 1 (the most error-prone code) and in the real throughput measured in step 0.
+1. **Fix generation:**
+   - Try the model card's recommended thinking-mode settings with a presence or repetition penalty.
+   - Try shorter budgets, with loop detection that truncates degenerate tails.
+   - Compare accuracy with thinking disabled on the same math problems.
+   - Check whether Qwen3.5-2B finishes reliably.
+2. **Broad self-generated set:** ~300M tokens of the base model's own responses to diverse prompts (chat, code,
+   math, general knowledge), filtered for loops. The native model provides dense per-token supervision, so no
+   labels are needed.
+3. **Verified reasoning set (Track Q only):** Nemotron-Math-v2 problems. Sample 8 times each, keep problems solved
+   1–6 times, keep correct traces. Nemotron-Math-v2 (December 2025) predates Qwen3.5's small models (March 2026),
+   so it is used for training only.
 
-### 3.3 Frozen-model measurements (step 3)
+### 4.3 Experiment 008: end-to-end bypass training
 
-These need no training and establish whether the idea has room to work.
+Train bypasses (and optionally shadow-write adapters) on KL to the stock model under real per-token routing with
+shadow writes. The router is held fixed: the clean-label router's plans, at target costs 5.0 and 4.5.
 
-1. **All 81 plans, applied per sequence.** Run every plan on the evaluation set, with each plan applied to all tokens of a sequence (§2.3 explains why shadows then go unread). Compare the best plan per problem against the rate at which a random plan fixes a wrong answer by chance. Computation is shared across plans with a common prefix of block decisions. Plans form a 3-ary tree over four decisions, which cuts block executions from ~490 to ~200 per sequence for teacher-forced passes (~2.4×).
-2. **Per-token map.** On teacher-forced sequences from the broad training set, record for every token the cheapest plan whose next-token distribution stays within ε of native (measured by `KL_t(native ‖ plan)`).
-3. **Inspection.** Check which tokens come out cheap. If function words, closing brackets, and multi-token word continuations tolerate short plans while numbers and answer tokens want more compute, the per-token premise holds.
-
-**Decision point:** if nearly all tokens need about the same compute, per-token routing has little to exploit, and the plan is revisited before any training.
-
-**Warm-up labels.** From the per-token map, build soft labels over the 81 plans:
-
-```
-p_t(P) ∝ exp( −[ metric_t(P) + λ_c · (cost(P) − 6) ] / T )
-```
-
-- Metric: `KL_t(native ‖ P)` for Track E; cross-entropy on verified traces for Track Q, where plans may beat native.
-- T is chosen so the best plan receives about half the probability mass on average.
-- Labels are marginalized to per-block distributions over {skip, keep, repeat} to match the router's four heads.
-- The router is pretrained on them with cross-entropy, adapters untouched.
-
-**Known bias in these labels.** Each measurement uses one plan for every token, so a token's label assumes all earlier tokens took the same plan. This is pessimistic about skipping for easy tokens surrounded by hard ones, and optimistic about repeats. A more faithful "native-context" labeling would run one token along each plan while earlier tokens stay native. For attention that is straightforward; for DeltaNet it requires querying the native state just before each position (feasible by shifting queries by one position in the chunked kernel). It is built only if the warm start proves important.
-
-### 3.4 Data
-
-| Dataset | Contents | Size | Used by |
-|---|---|---|---|
-| **Broad self-generated set** | Qwen3.5-0.8B's own responses, thinking enabled, to diverse prompts (chat, code, math, general knowledge) | ~300M tokens | All training (distillation target); per-token map |
-| **Verified reasoning set** | Nemotron-Math-v2 problems. Sample the base model 8 times each, keep problems solved 1–6 times, keep the correct traces | Depends on yield | Track Q correct-answer loss |
-| **Warm-up set** | A few thousand sequences from the broad set, labeled via §3.3 | ~5k sequences | Router warm start |
-
-- **Why self-generated data:** it matches the post-trained model's own distribution and how it is used at inference, which keeps the adapters' job small. The native model provides free, dense supervision on every token.
-- **Why the base model's own correct traces rather than dataset-provided traces:** Nemotron-Math-v2 traces come from a much larger model (gpt-oss-120b). Imitating them would teach style rather than capability. Rejection sampling from the base model keeps traces in-distribution while verifying correctness.
-- **Contamination:** Nemotron-Math-v2 (December 2025) predates Qwen3.5's small models (March 2026), and its problems derive from public forums (AoPS, Math StackExchange). It is used for training only; evaluation uses a separate clean set (§3.5). All training sets are deduplicated against the evaluation set.
-
-### 3.5 Evaluation
-
-**Clean evaluation set**
-
-| Tier | Source | Size | Role |
-|---|---|---|---|
-| A | Procedurally generated problems, freshly instanced: algorithmic tasks (BeyondBench-style) and templated word problems with new numbers and entities (GSM-Symbolic-style) | 1,000–2,000 | Primary, statistically powered result |
-| B | Human-written problems published after March 2026 at accessible difficulty (e.g., post-release LiveBench math, spring and summer 2026 contests) | 200–400 | Directional check on real problems |
-| C | MathArena competitions after the model's release | As available | Larger models only |
-
-Rules:
-
-- **Calibrate difficulty at the generator level, not per item.** Tune generator settings so the base model (thinking enabled) averages 20–60% accuracy. Selecting individual items by base-model performance biases comparisons through regression to the mean.
-- **Generate once with a fixed seed, fingerprint, and freeze** before any routing experiment.
-- **Report tiers separately.**
-- **Sample size:** detecting a ~4-point paired accuracy difference at ~80% power needs roughly 750–1,000 problems, which is why Tier A carries the main result.
-
-**General-ability checks** (no degradation from routing): MMLU-Pro (knowledge), IFEval (instruction following), and perplexity on held-out ordinary text. These run with the router active, because per-token routing affects every token of every input.
-
-**Efficiency metrics** (reported with every accuracy number):
-
-1. **Blocks per token:** full block executions, from router decisions.
-2. **Weight bytes read per token:** full visits count all block weights; shadow writes count only their projection matrices; the output layer is included. This is the best proxy for decoding speed, which is memory-bandwidth-bound.
-3. **Measured decoding speed** at batch size 1. With one token at a time, skipped blocks simply do not run apart from their shadow writes, so plain PyTorch shows the real speedup without custom kernels. Prompt processing with mixed per-token paths would need custom kernels and is not measured.
-
-**Diagnostics**
-
-- **Perfect-cache check:** at evaluation, replace every shadow entry with the real entry (computed by actually running the block) and measure how much of the gap to the base model closes. This is an upper bound on what better shadow writes could gain.
-- **Routing patterns:** which tokens skip, which repeat, and how that relates to base-model next-token entropy.
-- **Shadow imitation error per layer:** expected to increase from layer 2 to layer 4.
-- **Random-routing control:** random per-token plans at the same average compute, confirming the router learns something beyond compute allocation.
-
-### 3.6 Experiments
-
-The full cross of adapter variants × warm start × budget settings would be 18 runs times seeds. Experiments are staged instead, each stage using the previous stage's winner.
-
-| Stage | Configurations | Settings | Question |
-|---|---|---|---|
-| 1. Adapter variant | V1, V2, V3 | Track E, budget 5, cold start, 100M tokens, 1 seed | Which adapter setup works |
-| 2. Warm start | Best variant × {cold, warm} × {Track E @ 5, Track Q @ 6} | 300M tokens, 3 seeds each | Whether frozen-model labels help, and on which track |
-| 3. Budget sweep | Best variant + winning initialization | Track E at budgets 4, 4.5, 5, 5.5 | The quality-versus-compute curve |
-
-About 11 configurations in total. Stage 2 uses three seeds because the warm-start effect may be small.
-
-**Comparing warm and cold starts**
-
-- Final quality at matched budget, paired on the same evaluation items, across seeds
-- Training tokens needed to reach a fixed distillation loss or accuracy
-- Stability: collapse events (router going all-keep or all-skip) during the budget ramp
-- Bias persistence: agreement between the warm-started router and its labels over training. High agreement combined with worse results than cold start means the label bias is sticking.
-
-If warm and cold tie, the warm start is dropped and the frozen-model measurements remain purely diagnostic. If the warm start clearly helps, the native-context labeling (§3.3) is built and added as a third arm.
-
-### 3.7 Default hyperparameters
-
-| Setting | Default | Rationale |
-|---|---|---|
-| Router | 2-layer MLP, hidden 256, on B0 output; keep logit strongly favored at init | Training starts at the base model's behavior, so nothing breaks before adapters learn |
-| Gumbel temperature | 1.0 → 0.3 over the first 60% of training, then held; hard samples in the forward pass throughout | High early gives smooth gradients and exploration; lower later aligns the gradient with hard inference-time choices; below ~0.2 gradients become noisy |
-| Learning rates | LoRA 2e-4, router 5e-5; 2% warmup, cosine decay | Standard LoRA rate; slower router avoids locking in choices before adapters adapt |
-| Router entropy bonus | 0.01, decaying to 0 by 30% of training | Prevents early collapse to all-keep or all-skip |
-| Budget schedule | Track E: 6 → target linearly over the first 50%, then held. Track Q: fixed at 6 | Adapters and shadow writes need time before heavy skipping; the hold lets the model settle at the evaluated budget |
-| Budget enforcement | Lagrange multiplier, dual ascent | Hits the target without hand-tuning a penalty weight |
-| Distillation loss | KL(native ‖ routed) on every token, temperature 1 | Standard distillation; penalizes dropping probability the base model assigns |
-| Track Q mix | Alternating 50/50 batches: CE on verified traces, KL on the broad set | CE drives improvement; KL anchors against drift. Adjust if general-ability checks slip |
-| Shadow loss weight | 0.1, per-layer errors normalized to target scale | Guides without dominating; the end-to-end loss decides what matters |
-| Full-visit LoRA | Rank 16 (α = 32) on all linear layers of the block | Common fine-tuning size; enough capacity for distribution-shift corrections without overwhelming routing |
-| Shadow LoRA | Rank 32 on write projections only | Harder job (predicting one to three layers ahead) on small matrices, so higher rank is cheap |
-| Sequence length / batch | 4,096 tokens; ~64k tokens per step | Thinking traces are long; ~4,600 steps per 300M-token run leaves room for the schedules |
-| Warm-up label temperature | Top plan receives ~50% of probability mass on average | Soft enough for near-ties, sharp enough to be informative |
-| Warm-start training | Router only, one epoch over the labels, learning rate 1e-3 | Supervised pretraining of a small fresh network |
-
-### 3.8 LoRA capacity ladder
-
-The claim that LoRA can stand in for from-scratch training is tested directly. If the gap between routed and native loss stops shrinking during training, move up one rung:
-
-1. Rank 16 full-visit and rank 32 shadow adapters (the defaults)
-2. Higher rank (64–256)
-3. Unfreeze the routable blocks, with the KL-to-native loss as an anchor
-4. Full uptraining, the regime used by Relaxed Recursive Transformers
-
-**Token-budget check:** train V2 on a few hundred million tokens and plot loss on off-native visits against native loss. A gap that keeps shrinking means data is the bottleneck. One that plateaus early means capacity is.
-
-### 3.9 Compute budget (single RTX 5090, 32 GB)
-
-| Item | Estimate |
+| Variant | Trainable components |
 |---|---|
-| Training cost | ~8 GFLOP per token: three branches per routable block, the teacher pass, the large output layer |
-| Tokens per run | 300M for main runs; 100M for screening runs |
-| Time per 300M-token run | ~12–24 hours, assuming 25–35% of peak throughput |
-| Broad set generation | ~6 hours |
-| Verified set generation | ~9 hours |
-| Frozen-model measurements | Hours (warm-up labels) to several hours (81 plans on the evaluation set with thinking) |
-| Full 0.8B experiment plan | ~2 weeks of GPU time |
-| 2B follow-up | ~1–2 weeks |
+| A | Bypass MLPs (hidden 1024), initialized from the regression fit |
+| B | A + shadow-write adapters (rank 32, layers 2–4 of each bypassed block) |
+| C | A with larger bypasses (hidden 4096) |
+| D | A initialized from zero (checks how much the regression initialization matters) |
 
-These are estimates until the throughput measurements in step 0. Qwen3.5-0.8B and 2B fit comfortably in 32 GB. For the third rung: 4B is easy; 9B needs QLoRA and is tight with three-branch training, and its 32 layers form 8 blocks, 6 routable (729 plans instead of 81); 27B requires rented hardware.
+- **Targets:** damage at 5 blocks from 0.067 toward the oracle-bypass level (~0.03); variant B is the only one that
+  can go below it.
+- **Defaults:**
+  - AdamW, learning rate 3e-4 with cosine decay
+  - Sequences of 4,096 tokens, ~64k tokens per step
+  - 50–100M training tokens
+  - Gradient checkpointing per block
+  - Optional local regression loss, weight 0.1
+- **Compute:** roughly 5 GFLOP per token: the routed forward and backward through the frozen layers, plus a
+  no-gradient teacher pass. That's a few hours per variant on one RTX 5090.
+- **Evaluation:** same held-out split and metrics as experiment 007, plus damage split into kept-everywhere and
+  bypassing tokens, and an own-damage vs. contamination split via native-write substitution.
 
-### 3.10 Risks and open questions
+### 4.4 Router training under real execution
 
-| Risk | Mitigation or signal |
+After 008, train the router jointly with the bypasses using one of the two approaches in §3.5, under a compute
+budget enforced by a Lagrange multiplier. The budget schedule starts at 6 blocks and lowers linearly to the target
+over the first half of training. Compare against the fixed clean-label router.
+
+### 4.5 Efficiency evaluation
+
+- Budget sweep at 5.5, 5.0, 4.5, and 4.0 blocks per token.
+- Three efficiency metrics:
+  - blocks per token
+  - weight bytes read per token, counting bypasses and shadow-write projections
+  - measured batch-1 decoding speed, where skipped blocks simply don't run apart from shadow writes and the bypass
+- Profile where decoding time actually goes at this size: per-layer kernel-launch overhead may matter more than
+  memory reads.
+
+### 4.6 Track Q: can repeats help?
+
+In experiment 002, some plan beat stock by more than 0.1 nats for 46% of tokens, versus 9% for one random plan. But
+picking the best of 80 perturbations always looks good, and every plan was worse than stock on average. The fair
+test is best-of-80 random hidden-state perturbations with the same KL as the repeat plans. If noise wins as often
+as repeats, Track Q has no zero-shot support. If repeats clearly win, add repeat slots and train at budget 6 with the
+verified-trace loss.
+
+### 4.7 Evaluation
+
+- **Clean evaluation set:**
+  - Tier A: 1,000–2,000 procedurally generated problems (BeyondBench-style algorithmic tasks and GSM-Symbolic-style
+    templates with fresh values), calibrated at the generator level so the base model with thinking enabled scores
+    20–60%, then frozen with a fixed seed.
+  - Tier B: 200–400 human-written problems published after March 2026.
+  - Tier C: MathArena competitions after the model's release, for larger models.
+- **General ability:** MMLU-Pro, IFEval, perplexity on held-out text, with the router active.
+- **Generation, not just teacher forcing:** measure accuracy and drift in free generation, where routing errors can
+  compound.
+- **Reporting:** blocks per token and bytes read per token next to every accuracy number. All results are reported;
+  no success thresholds are pre-registered.
+
+### 4.8 Scaling
+
+Rerun the winning configuration on Qwen3.5-2B (same layout). Then choose a third model: 4B or 9B on one RTX 5090
+(9B has 32 layers, 8 blocks, 6 routable), or 27B on rented hardware.
+
+### 4.9 Risks and open questions
+
+| Risk | Signal or mitigation |
 |---|---|
-| Little per-token variation in required compute | Detected before training by the per-token map (§3.3) |
-| Shadow writes too inaccurate, especially at layer 4 | Perfect-cache check; raise shadow rank; fallback is the sparse-cache approach with cache-hole-adaptation training (CHASE) |
-| Router collapse | Keep-biased init, entropy bonus, slow router learning rate, budget schedule |
-| Gap between soft training and hard inference | Temperature annealing; always evaluate with hard choices |
-| Router input (B0 output) too weak a signal | Check correlation between router decisions and base-model next-token entropy before blaming training |
-| LoRA capacity insufficient | Capacity ladder (§3.8) |
-| Limited efficiency headroom at 0.8B | Output-layer ceiling (§2.8); expected to improve at 2B and beyond |
-| Warm-up label bias | Cold-start arm; bias-persistence tracking |
-| Throughput estimates off | Measured in step 0; screening runs at 100M tokens |
-
-**Deferred decisions**
-
-- Third-rung model (4B, 9B, or 27B), after the 0.8B and 2B results
-- Specific Tier B sources and their licensing
-- Lazy repeat-slot shadows: skip shadow writes into Bj′ until some token actually repeats block j (a compute optimization)
-- Native-context warm-up labels, only if the warm start matters
+| Training doesn't move bypasses much beyond the regression fit | Variant D vs. A; the local loss; larger bypasses |
+| In-block shadow writes remain the floor | Variant B; oracle-bypass comparison |
+| Router training under mixed execution is unstable | Start from the clean-label router; budget schedule; compare (a) and (b) |
+| Generation data stays degenerate at 0.8B | Loop filtering; thinking-off data; generate data with 2B |
+| Teacher-forced gains don't carry over to free generation | Generation-based evaluation (§4.7) |
+| Efficiency gains are small at 0.8B | Expected from the output-layer share; the efficiency case rests on 2B+ |
+| Probes and bypasses fit on ~250 sequences don't generalize | Refit on the broad self-generated set |
 
 ---
 
-## 4. Code
+## 5. Code
 
-### 4.1 Guiding structure
+### 5.1 Current repository
 
-The center of the codebase is **one model class that runs in three modes, sharing all core code**:
-
-1. **Fixed plan:** one routing plan for every token of a sequence. Used for frozen-model measurements and testing.
-2. **Hard per-token:** router argmax per token. Used for evaluation and inference.
-3. **Gumbel:** all three branches computed per routable block, straight-through Gumbel selection. Used for training.
-
-Data generation, measurements, training, and evaluation are separate packages around it.
-
-### 4.2 Repository layout
+The investigation code is organized as a library plus one directory per experiment:
 
 ```
-llmro-router/
-├── pyproject.toml              # dependencies, managed with uv
-├── configs/                    # one YAML file fully describes each run
-│   ├── model/                  #   base model, block grouping
-│   ├── stage0/                 #   frozen-model measurement settings
-│   ├── train/                  #   one file per experiment
-│   └── eval/
-├── src/routed/
-│   ├── model/
-│   │   ├── layers.py           # wraps each Qwen3.5 layer with run() and write_only()
-│   │   ├── blocks.py           # groups layers into 6 blocks; runs a block as a unit
-│   │   ├── cache.py            # static 10-slot cache: attention KV + DeltaNet states per slot
-│   │   ├── plan.py             # routing plans; mapping from block visits to cache slots
-│   │   └── routed_model.py     # full forward pass; the three execution modes
-│   ├── router/
-│   │   ├── router.py           # MLP with four 3-way heads
-│   │   └── gumbel.py           # straight-through Gumbel sampling, temperature handling
-│   ├── adapters/
-│   │   ├── lora.py             # LoRA module, zero init, SVD init support
-│   │   ├── jump.py
-│   │   ├── repeat.py
-│   │   ├── shadow.py
-│   │   └── control.py          # adapters_disabled() context manager (teacher mode)
-│   ├── data/
-│   │   ├── procedural/         # Tier A evaluation generators
-│   │   ├── selfgen.py          # broad self-generated set via vLLM
-│   │   ├── verified.py         # sampling, verification, and filtering of Nemotron-Math-v2
-│   │   ├── packing.py          # tokenization and packing into 4,096-token sequences
-│   │   └── manifest.py         # dataset shards with generator version, model, seed
-│   ├── stage0/
-│   │   ├── enumerate.py        # all 81 plans with shared-prefix computation
-│   │   └── token_map.py        # per-token cheapest plans; warm-up labels
-│   ├── train/
-│   │   ├── losses.py           # KL to native, budget (Lagrangian), shadow imitation, CE
-│   │   ├── schedules.py        # temperature, budget, entropy-bonus schedules
-│   │   ├── shadow_prefit.py    # least-squares + SVD init; shadow-only pre-fit
-│   │   ├── warmstart.py        # router pretraining on warm-up labels
-│   │   └── trainer.py          # loop; separate optimizer groups for router and adapters
-│   └── eval/
-│       ├── harness.py          # clean eval tiers; MMLU-Pro and IFEval via lm-evaluation-harness; perplexity
-│       ├── generate.py         # batched generation for correctness evaluation
-│       ├── efficiency.py       # blocks/token, bytes/token, batch-1 decoding speed
-│       └── diagnostics.py      # perfect-cache check, routing patterns, shadow error
-├── scripts/                    # thin CLI entry points; no logic
-│   ├── generate_data.py
-│   ├── build_eval.py
-│   ├── run_stage0.py
-│   ├── train.py
-│   └── evaluate.py
-├── tests/
-└── experiments/                # run outputs; git-ignored except summaries
+qwen35-investigate/
+├── pyproject.toml                  # uv-managed
+├── src/qwen35_investigate/
+│   ├── pertoken.py                 # per-token routing: parallel teacher-forced path (routed_forward, routed_blocks),
+│   │                               #   token-by-token path with a cache (routed_decode), DecoderLayer.write_only
+│   │                               #   (shadow writes), perfect-cache mode, ProbeRouter
+│   ├── substitution.py             # replacing selected cache writes with the stock model's: routed_blocks_sub,
+│   │                               #   substituted_decode, NativeWrites, deviation_masks, actual_writes
+│   ├── delta_rule.py               # chunked DeltaNet readouts of the state before each position's update
+│   ├── write_correction.py         # closed-form low-rank write corrections
+│   └── bypass.py                   # bypass families and fitting
+├── experiments/
+│   └── NNN_<name>/                 # 001–007, e.g. 002_per_token_routing, 004_pertoken_shadow_writes,
+│       ├── README.md               #   005_write_substitution, 006_write_correction, 007_block_bypass
+│       ├── run.py                  # staged pipeline (--stage)
+│       ├── report.py
+│       └── results/                # reports and plots tracked; large intermediates git-ignored
+└── data/activations/               # extracted hidden states (git-ignored)
 ```
 
-### 4.3 Design decisions
+Conventions:
 
-1. **Wrap the Hugging Face implementation; do not fork it.** Load the official Qwen3.5 weights and layer modules, and drive them from a custom forward loop that decides which layer runs and which cache slot it uses. The stock cache assumes one entry per physical layer, which repeats break, so `cache.py` replaces it entirely. The DeltaNet layer forward is likely reimplemented thinly so it takes and returns its recurrent and convolution state explicitly, while calling the same fast kernels.
+- Every experiment has a README with question, setup, results, deviations, and limitations.
+- Runs are reproducible from their scripts.
+- Every result is backed by sanity checks that must reproduce earlier experiments exactly.
 
-2. **Every layer wrapper exposes two operations.**
-   - `run(h, slot, positions) → (h_out, slot)`: full computation.
-   - `write_only(h, slot, positions) → slot`: shadow write. Projections and state update only; the hidden state is untouched.
+### 5.2 Additions for the training phase
 
-   Blocks and the routed model are built entirely from these two calls.
+```
+src/qwen35_investigate/
+├── model/
+│   ├── routed.py                   # one routed model, three modes: fixed plan per sequence, hard per-token,
+│   │                               #   straight-through Gumbel (all branches computed)
+│   └── cache.py                    # per-block slots; separate repeat slots if Track Q proceeds
+├── router/
+│   ├── damage_router.py            # predicts damage per plan; argmin + λ·cost
+│   └── gumbel_router.py            # sequential per-block heads for joint training
+├── adapters/
+│   ├── bypass.py                   # trainable bypass MLPs (initialized from fitted ones)
+│   ├── shadow.py                   # shadow-write LoRA on write projections of layers 2–4
+│   └── control.py                  # adapters_disabled(): the teacher is the same object
+├── data/
+│   ├── selfgen.py                  # broad self-generated set via vLLM, with loop filtering
+│   ├── verified.py                 # rejection-sampled correct traces (Track Q)
+│   ├── procedural/                 # clean evaluation generators (Tier A)
+│   ├── packing.py
+│   └── manifest.py                 # shards with generator version, model, seed
+├── train/
+│   ├── losses.py                   # KL to stock, budget (Lagrangian), local regression, CE
+│   ├── schedules.py                # Gumbel temperature, budget, entropy bonus
+│   └── trainer.py                  # separate optimizer groups for router and adapters
+└── eval/
+    ├── harness.py                  # clean tiers; MMLU-Pro and IFEval via lm-evaluation-harness; perplexity
+    ├── generate.py                 # free generation with per-token routing
+    ├── efficiency.py               # blocks/token, bytes/token, batch-1 decoding speed
+    └── diagnostics.py              # native-write substitution, oracle bypass, routing patterns
+```
 
-3. **The teacher is the same object.** `adapters_disabled()` plus the all-keep plan gives the base model: no second weight copy in memory, and no possibility of teacher drift.
+Design rules carried forward:
 
-4. **Correctness and speed are evaluated separately.**
-   - Correctness: batched generation in which every token computes all branches and keeps the router's choice. Wasteful but correct, and fast enough for the full evaluation set.
-   - Speed: batch-1 decoding with true skipping.
+1. **Wrap the Hugging Face implementation; don't fork it.** A custom forward loop decides which layer runs and which
+   cache slot it uses. DeltaNet layers take and return their state explicitly and call the same fast kernels.
+2. **Every layer exposes `run` and `write_only`,** so shadow writes and routing are built from two calls.
+3. **The teacher is the same object** with adapters disabled and all blocks kept: no second weight copy, no drift.
+4. **Evaluate correctness and speed separately.** Batched evaluation computes every branch and selects; speed is
+   measured with batch-1 decoding and true skipping. vLLM is used only to generate data from the base model.
+5. **Checkpoints hold only trained components** (router, bypasses, adapters): tens of MB.
 
-   vLLM cannot run the modified model, so it is used only to generate data from the base model.
+### 5.3 Tests that gate the training code
 
-5. **Runs are reproducible from a single file.** Each run stores its YAML config, git commit, random seeds, a metrics log, and a checkpoint containing **only the router and adapters** (tens of MB; base weights are never re-saved). Datasets are written as shards with a manifest. The evaluation set is frozen and fingerprinted.
-
-### 4.4 Tests
-
-These gate everything built on top of the model code.
+Most of these already exist as experiment sanity checks and should become unit tests:
 
 | Test | Asserts |
 |---|---|
-| `test_native_equivalence` | The all-keep plan with adapters disabled reproduces the base model's logits (within floating-point tolerance). **The most important test; nothing else is built until it passes.** |
-| `test_decode_consistency` | Token-by-token generation matches whole-sequence processing, for arbitrary per-token plans |
-| `test_cache_slots` | Repeats and skips read and write the correct slots; repeat passes never touch first-pass slots |
-| `test_shadow_first_layer` | Shadow writes at layer 1 of each block exactly match real writes |
-| `test_uniform_plan_equivalence` | With one plan for all tokens, results match a per-sequence implementation with no shadow writes |
-| `test_gumbel_branches` | Each branch computed in Gumbel mode matches the hard per-token mode for the same choice |
-| `test_adapter_gating` | All adapter contributions are exactly zero on native visits |
+| Native equivalence | The all-keep plan with adapters disabled reproduces stock logits exactly |
+| Uniform-plan equivalence | With one plan for all tokens, per-token routing reproduces whole-sequence routing exactly |
+| Parallel vs. token-by-token | Teacher-forced and token-by-token paths agree to within bf16 and chunked-vs-recurrent kernel noise, for fixed plans |
+| Shadow writes | `write_only` stores exactly what a full `run` would for the same input; layer-1 shadow writes equal real writes |
+| Zero bypass | A bypass with `f = 0` reproduces plain skipping exactly |
+| Substitution | With all writes native, kept-everywhere tokens have exactly zero damage |
+| Adapter gating | Every adapter contributes exactly zero on native visits |
 
-### 4.5 Build order
+### 5.4 Tooling
 
-| Plan step | Code |
-|---|---|
-| 1. Modified model | `model/`, `tests/` |
-| 2. Evaluation set | `data/procedural/`, `eval/harness.py`, `eval/generate.py` |
-| 3. Frozen-model measurements | `stage0/` |
-| 4. Training data | `data/selfgen.py`, `data/verified.py`, `data/packing.py`, `data/manifest.py` |
-| 5. Training | `router/`, `adapters/`, `train/` |
-| 7. Evaluation | `eval/efficiency.py`, `eval/diagnostics.py` |
-
-### 4.6 Tooling
-
-- **Environment:** uv; PyTorch; transformers with Qwen3.5 support; flash-linear-attention and causal-conv1d for DeltaNet kernels
+- **Environment:** uv, PyTorch, transformers with Qwen3.5 support, flash-linear-attention and causal-conv1d
 - **Data generation:** vLLM (base model only)
-- **Evaluation:** lm-evaluation-harness with a custom model wrapper for MMLU-Pro and IFEval
+- **Evaluation:** lm-evaluation-harness with a custom model wrapper
 - **Testing:** pytest
-- **Experiment tracking:** Weights & Biases or a local logger writing `metrics.jsonl` per run
+- **Tracking:** per-run `metrics.jsonl` plus Weights & Biases or a local logger
+- **Storage:** large intermediates (extracted activations, per-token results) stay git-ignored; reports and plots
+  are tracked
 
 ---
 
@@ -536,22 +529,23 @@ These gate everything built on top of the model code.
 
 | Term | Meaning |
 |---|---|
-| **Block** | One group of four consecutive layers: three Gated DeltaNet layers followed by one full-attention layer. Qwen3.5-0.8B has six (B0–B5). |
-| **Routable block** | B1–B4, which can be skipped, kept, or repeated per token. B0 and B5 always run once. |
-| **Routing plan** | The four actions (skip, keep, repeat) for one token's routable blocks; 81 possibilities. |
-| **Native** | Every block kept exactly once, i.e., the original model's computation. |
-| **Off-native visit** | A block execution whose input differs from what the original model would give it: a repeat pass, or the first layer after a skipped block. |
-| **Cache slot** | Storage for one block visit: one full-attention KV cache plus three DeltaNet recurrent and convolution states. The static design has ten. |
-| **Full visit** | A block execution that updates the hidden state and writes its cache entries. |
-| **Shadow write** | The cache entries a skipping token still writes, computed from its unchanged hidden state using only the cheap projections. |
-| **Jump adapter** | LoRA on the first layer of a block entered right after a skipped block. |
-| **Repeat adapter** | LoRA on a block's second pass. |
-| **Shadow adapter** | LoRA on the write projections of layers 2–4, correcting shadow writes toward what a real visit would have written. |
-| **Straight-through Gumbel** | Training trick for discrete choices: hard random samples in the forward pass, gradients of the smooth (softmax) version in the backward pass. |
-| **Teacher** | The base model's predictions (adapters off, all blocks kept), used as the distillation target. |
-| **Budget** | Target average number of block executions per token (native = 6). |
-| **Warm start** | Pretraining the router on labels derived from frozen-model measurements before joint training. |
-| **Track E / Track Q** | The efficiency goal (fewer blocks, same quality) and the quality goal (better answers, same compute). |
+| **Block** | Four consecutive layers: three Gated DeltaNet layers, then one full-attention layer. Qwen3.5-0.8B has six (B0–B5). |
+| **Routable block** | B1–B4, which each token can keep or bypass. B0 and B5 always run. |
+| **Plan** | One token's actions for B1–B4: 16 keep/bypass plans (81 with repeats). |
+| **Cost** | Blocks executed per token; stock is 6. |
+| **Damage** | KL(stock ‖ modified) over the full vocabulary, in nats per token. |
+| **Skip** | Bypassing a block with the identity: the hidden state passes through unchanged. |
+| **Bypass** | A small learned MLP predicting a block's residual update from the token's own hidden state. |
+| **Shadow write** | The cache entries a token writes for a block it didn't run, computed from its unchanged input. |
+| **Deviated token** | At a given layer, a token that skipped or bypassed that block or an earlier one. |
+| **Native write** | The cache entry the stock model would have written at that position and layer. |
+| **Contamination** | Damage to other tokens from reading deviated tokens' off-native cache writes. |
+| **Whole-sequence labels** | Per-token damage measured with every token on the same plan. |
+| **Clean labels** | Per-token damage measured with every cache write native, so it depends only on the token's own plan. |
+| **Oracle bypass** | A bypass that reproduces each token's exact block output in context; the ceiling for per-token approximation while in-block writes remain shadows. |
+| **Teacher** | The same frozen model with adapters off and all blocks kept, used as the training target. |
+| **Straight-through Gumbel** | Training discrete choices with hard random samples in the forward pass and gradients of the smooth version in the backward pass. |
+| **Track E / Track Q** | The efficiency goal and the quality goal. |
 
 ## References
 
@@ -562,8 +556,8 @@ These gate everything built on top of the model code.
 - Gromov et al., 2024. *The Unreasonable Ineffectiveness of the Deeper Layers.*
 - Heakl et al., 2025. *DR.LLM.*
 - Lad, Gurnee & Tegmark, 2024. *The Remarkable Robustness of LLMs: Stages of Inference?*
-- Li et al., 2025. *CoLa: chain-of-layers test-time depth adaptation.*
-- POLAR, ICML 2026. *Up-front layer-program prediction for pretrained LLMs.*
+- Li et al., 2025. *CoLa.* (Full title to be filled in.)
+- POLAR, ICML 2026. (Full citation to be filled in.)
 - Raposo et al., 2024. *Mixture-of-Depths.*
 - Schuster et al., 2022. *Confident Adaptive Language Modeling* (CALM).
 - Vendrell et al., 2026. *Memory-Efficient Looped Transformer: Decoupling Compute from Memory in Looped Language Models* (MELT). arXiv:2605.07721.
